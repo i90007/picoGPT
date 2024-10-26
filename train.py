@@ -17,7 +17,7 @@ seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = True # use PyTorch 2.0 to compile the model to be faster
-profile = False # use pytorch profiler, or just simple benchmarking?
+max_iters = 600000 # total number of training iterations
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
@@ -63,52 +63,28 @@ if compile:
     print("Compiling model...")
     model = torch.compile(model) # pytorch 2.0
 
-if profile:
-    wait, warmup, active = 5, 5, 5
-    num_steps = wait + warmup + active
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./bench_log'),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False, # incurs an additional overhead, disable if not needed
-        with_flops=True,
-        with_modules=False, # only for torchscript models atm
-    ) as prof:
-
+# simple benchmarking
+torch.cuda.synchronize()
+iter_num = 0
+while True:
+    t0 = time.time()
+    X, Y = get_batch('train')
+    for k in range(num_steps):
+        with ctx:
+            logits, loss = model(X, Y)
         X, Y = get_batch('train')
-        for k in range(num_steps):
-            with ctx:
-                logits, loss = model(X, Y)
-            X, Y = get_batch('train')
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            lossf = loss.item()
-            print(f"{k}/{num_steps} loss: {lossf:.4f}")
-
-            prof.step() # notify the profiler at end of each step
-
-else:
-
-    # simple benchmarking
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        lossf = loss.item()
+        print(f"{k}/{num_steps} loss: {lossf:.4f}")
     torch.cuda.synchronize()
-    for stage, num_steps in enumerate([10, 20]): # burnin, then benchmark
-        t0 = time.time()
-        X, Y = get_batch('train')
-        for k in range(num_steps):
-            with ctx:
-                logits, loss = model(X, Y)
-            X, Y = get_batch('train')
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            lossf = loss.item()
-            print(f"{k}/{num_steps} loss: {lossf:.4f}")
-        torch.cuda.synchronize()
-        t1 = time.time()
-        dt = t1-t0
-        mfu = model.estimate_mfu(batch_size * 1 * num_steps, dt)
-        if stage == 1:
-            print(f"time per iteration: {dt/num_steps*1000:.4f}ms, MFU: {mfu*100:.2f}%")
+    t1 = time.time()
+    dt = t1-t0
+    mfu = model.estimate_mfu(batch_size * 1 * num_steps, dt)
+    if stage == 1:
+        print(f"iter {stage}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
+    iter_num += 1
+    # termination conditions
+    if iter_num > max_iters:
+        break
