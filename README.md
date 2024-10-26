@@ -23,7 +23,7 @@ Dependencies:
 
 ## quick start
 
-If you are not a deep learning professional and you just want to feel the magic and get your feet wet, the fastest way to get started is to...
+If you are not a deep learning professional and you just want to feel the magic and get your feet wet, the fastest way to get started is to load pretrained weights and run sample.py
 
 ## baselines
 
