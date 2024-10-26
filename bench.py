@@ -1,5 +1,5 @@
 """
-A much shorter version of train.py for benchmarking
+This training script for running on a single gpu 
 """
 import os
 from contextlib import nullcontext
@@ -64,9 +64,6 @@ if compile:
     model = torch.compile(model) # pytorch 2.0
 
 if profile:
-    # useful docs on pytorch profiler:
-    # - tutorial https://pytorch.org/tutorials/intermediate/tensorboard_profiler_tutorial.html
-    # - api https://pytorch.org/docs/stable/profiler.html#torch.profiler.profile
     wait, warmup, active = 5, 5, 5
     num_steps = wait + warmup + active
     with torch.profiler.profile(
