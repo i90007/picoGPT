@@ -38,7 +38,7 @@ OpenAI GPT-2 checkpoints allow us to get some baselines in place for openwebtext
 
 ## todos
 
-- Add memO.
+- Add memorising like [here](https://colab.research.google.com/drive/1XZz1sjNt1MKRG6ul_hOGSJFQLS4lRtmJ).
 - Teach the model to communicate in the form of a chat.
 - Make weights for Ukrainian language.
 - Teach the model to communicate by voice as the main model of chatGPT. I'm going to add a seperate agent for a voice recognition (via OpenAI Swarm).
