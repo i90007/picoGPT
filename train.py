@@ -2,6 +2,7 @@
 This training script for running on a single gpu 
 """
 import os
+from dataclasses import dataclass
 from contextlib import nullcontext
 import numpy as np
 import time
@@ -9,9 +10,7 @@ import torch
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
-batch_size = 12
-block_size = 1024
-bias = False
+batch_size = 8 # max for T4 in Google Colab
 real_data = True
 seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
@@ -20,7 +19,15 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 max_iters = 600000 # total number of training iterations
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
-
+@dataclass
+class GPTConfig:
+    block_size: int = 1024 # how far back does the model look? i.e. context size
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12 # size of the model
+    n_head: int = 12 # size of the model
+    n_embd: int = 768 # size of the model
+    dropout: float = 0.1 # for determinism
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
@@ -48,13 +55,7 @@ else:
     get_batch = lambda split: (x, y)
 
 # model init
-gptconf = GPTConfig(
-    block_size = block_size, # how far back does the model look? i.e. context size
-    n_layer = 12, n_head = 12, n_embd = 768, # size of the model
-    dropout = 0, # for determinism
-    bias = bias,
-)
-model = GPT(gptconf)
+model = GPT(GPTConfig())
 model.to(device)
 
 optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
