@@ -3,7 +3,7 @@
 
 ![nanoGPT](assets/nanogpt.jpg)
 
-I made this fork to make some improvements and add some new features to Karpathy's project
+I made this fork to make some improvements and add some new features to Karpathy's [project](https://github.com/karpathy/nanoGPT)
 
 ## install
 
