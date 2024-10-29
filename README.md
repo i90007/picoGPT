@@ -1,9 +1,9 @@
 
-# nanoGPT
+# picoGPT
 
 ![nanoGPT](assets/nanogpt.jpg)
 
-I made this fork to make some improvements and add some new features to GPT-2
+I made this fork to make some improvements and add some new features to Karpathy's project
 
 ## install
 
