@@ -13,6 +13,7 @@ from einops import rearrange, einsum
 #!conda install faiss-gpu
 import faiss
 
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
     def __init__(self, ndim, bias):
@@ -22,20 +23,87 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
+    def forward(
+        self, x, # batch_size, block_size, n_embd
+        xl_memory = None
+    ):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        if xl_memory is not None:
+            k_xl, v_xl = xl_memory.unbind(dim = -2) # assume stacked
+            k = torch.cat((k_xl, k), dim = -2) # prepend XL memory
+            v = torch.cat((v_xl, v), dim = -2) # prepend XL memory
+            xl_sequence_length = k_xl.shape[1]
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        out = self.resid_dropout(self.c_proj(y))
+
+        # new XL memories
+        k = rearrange(k, 'b h t d -> b t (h d)', h = self.n_head)
+        v = rearrange(v, 'b h t d -> b t (h d)', h = self.n_head)
+        kv_memories = torch.stack((k, v), dim=-2) # (batch, sequence_len, 2, dimension)
+
+        if xl_memory is not None:
+            _, kv_memories = kv_memories[:, :-xl_sequence_length], kv_memories[:, -xl_sequence_length:]
+
+        return out, kv_memories
+
+# k-nearest-neibhor layer for the external memory
 class KNN():
-    def __init__(self, dim, max_memories):
-        self.dim = dim
+    def __init__(self, n_embd, max_memories):
         self.max_memories = max_memories
-        self.shape = (max_memories, 2, dim)
+        self.shape = (max_memories, 2, n_embd)
         self.db_offset = 0
         self.db_filepath = "./memory.memmap"
         self.db = np.memmap(self.db_filepath, mode = 'w+', dtype = np.float32, shape = self.shape)
-        self.index = faiss.IndexFlatL2(dim)
+        self.index = faiss.IndexFlatL2(n_embd)
 
     def add_to_db(self, new_data):
         new_data_len = new_data.shape[0]
         ids = (np.arange(new_data_len) + self.db_offset)
-        self.db[ids] = new_data.detach().cpu().numpy() #######
+        self.db[ids] = new_data.detach().cpu().numpy()
         self.db_offset += new_data_len
         # Write to file
         self.db.flush()
@@ -52,8 +120,8 @@ class KNN():
         # Add to db
         self.add_to_db(new_data)
         # Only keys are used in knn index
-        keys, vals = new_data.unbind(dim=-2)
-        keys = keys.detach().cpu().numpy() ######
+        keys, _ = new_data.unbind(dim=-2)
+        keys = keys.detach().cpu().numpy()
         # Add (b n) d tensors to index
         keys = np.ascontiguousarray(keys)
         # Add to index
@@ -61,7 +129,7 @@ class KNN():
 
     def search(self, query_vecs, topk):
         query_batch_size, query_seq_len = query_vecs.shape[0], query_vecs.shape[1]
-        device = query_vecs.device ######
+        device = query_vecs.device
         # Input is b n d, flatten to (b n) d
         query_vecs = query_vecs.flatten(0,1)
         kvs = self.search_and_retrieve(np.ascontiguousarray(query_vecs.detach().cpu().numpy()), topk) ######
@@ -75,92 +143,27 @@ class KNN():
         self.db[:] = 0
         self.db_offset = 0
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, embedding_dimension, heads=8, head_dimension=64, dropout=0.):
-        super().__init__()
-        self.heads = heads
-        self.dropout = nn.Dropout(dropout)
-        self.scale = head_dimension ** -0.5
-
-        self.query_matrix = nn.Linear(embedding_dimension, self.heads * head_dimension)
-        self.key_matrix = nn.Linear(embedding_dimension, self.heads * head_dimension)
-        self.value_matrix = nn.Linear(embedding_dimension, self.heads * head_dimension)
-        self.output_matrix = nn.Linear(self.heads * head_dimension, embedding_dimension)
-
-    def forward(
-        self, x, # batch_size, sequence_length, embedding_dimension
-        relative_positions = None, xl_memory = None
-    ):
-
-        device = x.device
-        queries = self.query_matrix(x)
-        keys = self.key_matrix(x)
-        values = self.value_matrix(x)
-
-        queries = queries * self.scale
-
-        if xl_memory is not None:
-            k_xl, v_xl = xl_memory.unbind(dim = -2) # assume stacked
-            keys = torch.cat((k_xl, keys), dim = -2) # prepend XL memory
-            values = torch.cat((v_xl, values), dim = -2) # prepend XL memory
-            xl_sequence_length = k_xl.shape[1]
-
-        queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.heads)
-        keys    = rearrange(keys, 'b t (h d) -> b h t d', h = self.heads)
-        qk      = einsum(queries, keys, 'b h i d, b h j d -> b h i j')
-
-        i, j = qk.shape[-2:]
-        if relative_positions is not None:
-            qk = relative_positions[..., -i:, -j:] + qk
-
-        qk = qk * self.scale
-
-        mask = torch.ones((i,j), dtype = torch.bool, device=device).triu(j-i+1)
-        qk = qk.masked_fill(mask, float('-inf'))
-
-        qk = F.softmax(qk, dim=-1)
-        qk = self.dropout(qk)
-
-        values = rearrange(values, 'b t (h d) -> b h t d', h=self.heads)
-        qkv = qk@values
-        qkv = rearrange(qkv, 'b h t d -> b t (h d)')
-
-        out = self.output_matrix(qkv)
-
-        # new XL memories
-        keys = rearrange(keys, 'b h t d -> b t (h d)', h = self.heads)
-        values = rearrange(values, 'b h t d -> b t (h d)', h=self.heads)
-        kv_memories = torch.stack((keys, values), dim=-2) # (batch, sequence_len, 2, dimension)
-
-        if xl_memory is not None:
-            _, current_input = kv_memories[:, :-xl_sequence_length], kv_memories[:, -xl_sequence_length:]
-            kv_to_add_xl = current_input
-        else:
-            kv_to_add_xl = kv_memories
-
-        return out, kv_to_add_xl
-
+# k-nearest-neibhor attention block for the external memory
 class KNNAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.heads = config.n_head
-        self.scale = config.head_dimension ** -0.5
+        self.n_head = config.n_head
         self.dropout = nn.Dropout(config.dropout)
 
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.query_matrix = nn.Linear(embedding_dimension, heads * head_dimension)
-        self.key_matrix = nn.Linear(embedding_dimension, heads * head_dimension)
-        self.value_matrix = nn.Linear(embedding_dimension, heads * head_dimension)
-        self.output_matrix = nn.Linear(heads * head_dimension, embedding_dimension)
-        self.final_attn = Block(config)
+        self.query_matrix = nn.Linear(config.n_embd, config.n_embd)
+        self.key_matrix = nn.Linear(config.n_embd, config.n_embd)
+        self.value_matrix = nn.Linear(config.n_embd, config.n_embd)
+        self.output_matrix = nn.Linear(config.n_embd, config.n_embd)
+        self.final_attn = MemBlock(config)
 
-        self.gate_bias = nn.Parameter(torch.randn(self.heads, 1, 1))
-        self.topk_retrieved_memories = topk_retrieved_memories
-        self.knn = knn
+        self.gate_bias = nn.Parameter(torch.randn(config.n_head, 1, 1))
+        self.topk_retrieved_memories = config.topk_retrieved_memories
+        self.knn = KNN(config.n_embd, config.max_knn_memories)
 
     def forward(
         self, x, # batch_size, sequence_length, embedding_dimension
-        relative_positions = None, xl_memory = None
+        xl_memory = None
     ):
         device = x.device
         x = self.ln_1(x)
@@ -178,8 +181,8 @@ class KNNAttention(nn.Module):
             xl_sequence_length = k_xl.shape[1]
 
         ### LOCAL ATTENTION
-        queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.heads)
-        keys    = rearrange(keys, 'b t (h d) -> b h t d', h = self.heads)
+        queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.n_head)
+        keys    = rearrange(keys, 'b t (h d) -> b h t d', h = self.n_head)
         qk      = einsum(queries, keys, 'b h i d, b h j d -> b h i j')
 
         i, j = qk.shape[-2:]
@@ -195,7 +198,7 @@ class KNNAttention(nn.Module):
 
         qk = self.dropout(qk)
 
-        values = rearrange(values, 'b t (h d) -> b h t d', h=self.heads)
+        values = rearrange(values, 'b t (h d) -> b h t d', h=self.n_head)
         qkv = qk@values
 
         ### KNN ATTENTION
@@ -207,15 +210,15 @@ class KNNAttention(nn.Module):
             queries = rearrange(queries, 'b h t d -> b t (h d)')
             mem_kv = self.knn.search(queries, topk = self.topk_retrieved_memories) # returns b t k 2 d
             mem_k, mem_v = mem_kv.unbind(dim = -2)
-            mem_k = rearrange(mem_k, 'b t k (h d) -> b h t k d', h=self.heads)
-            mem_v = rearrange(mem_v, 'b t k (h d) -> b h t k d', h=self.heads)
+            mem_k = rearrange(mem_k, 'b t k (h d) -> b h t k d', h = self.n_head)
+            mem_v = rearrange(mem_v, 'b t k (h d) -> b h t k d', h = self.n_head)
 
             # Convert queries to attention form
-            queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.heads)
+            queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.n_head)
             mem_qk = einsum(queries, mem_k, 'b h t d, b h t k d -> b h t k')
             mem_qk = mem_qk * self.scale
 
-            mem_qk = F.softmax(mem_qk, dim=-1)
+            mem_qk = F.softmax(mem_qk, dim = -1)
             mem_qk = self.dropout(mem_qk)
             mem_qkv = einsum(mem_qk, mem_v, 'b h t k, b h t k d -> b h t d')
 
@@ -224,15 +227,15 @@ class KNNAttention(nn.Module):
             combined_qkv = rearrange(combined_qkv, 'b h t d -> b t (h d)')
             out = self.output_matrix(combined_qkv)
             t2 = time.time()
-            print ("End KNN operations, time taken:", t2-t1)
+            print ("End KNN operations, time taken:", t2 - t1)
         else:
             qkv = rearrange(qkv, 'b h t d -> b t (h d)')
             out = self.output_matrix(qkv)
             out = self.final_attn(out)
 
         # New XL memories
-        keys = rearrange(keys, 'b h t d -> b t (h d)', h = self.heads)
-        values = rearrange(values, 'b h t d -> b t (h d)', h=self.heads)
+        keys = rearrange(keys, 'b h t d -> b t (h d)', h = self.n_head)
+        values = rearrange(values, 'b h t d -> b t (h d)', h = self.n_head)
         kv_memories = torch.stack((keys, values), dim=-2) # (batch, sequence_len, 2, dimension)
 
         if xl_memory is not None:
@@ -245,7 +248,7 @@ class KNNAttention(nn.Module):
         self.knn.add(current_kv)
         return out, current_kv
 
-
+# Multi level perceptron
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -260,8 +263,9 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
+    
 
-class Block(nn.Module):
+class MemBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -276,6 +280,7 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x, new_xl_memories
 
+
 class MemorizingGPT(nn.Module):  
     def __init__(self, config):
         super().__init__()
@@ -287,7 +292,7 @@ class MemorizingGPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([MemBlock(config) for _ in range(config.n_layer)]),
             knn_attention = KNNAttention(config),            
             ln_f = LayerNorm(config.n_embd, bias=config.bias)
         ))
@@ -344,8 +349,12 @@ class MemorizingGPT(nn.Module):
 
         # Store the XL memories for each pass
         new_memories = []
-        for block in self.transformer:
-            x, xl_mem = block(x, next(xl_memories_iter))
+        for i, block in enumerate(self.transformer):
+            if i == self.config.n_layer - 2:
+                x, xl_mem = self.transformer.knn_attention(x, next(xl_memories_iter))
+            else:
+                x, xl_mem = block(x, next(xl_memories_iter))
+
             if xl_mem is not None:
                 new_memories.append(xl_mem.detach())
 
