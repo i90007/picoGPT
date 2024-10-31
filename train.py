@@ -28,6 +28,8 @@ class GPTConfig:
     n_embd: int = 768 # size of the model
     dropout: float = 0.1 # for determinism
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    max_knn_memories: int = 81920
+    topk_retrieved_memories: int = 3
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
