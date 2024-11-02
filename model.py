@@ -13,7 +13,6 @@ from einops import rearrange, einsum
 #!conda install faiss-gpu
 import faiss
 
-
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
     def __init__(self, ndim, bias):
@@ -147,16 +146,25 @@ class KNN():
 class KNNAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
-        self.dropout = nn.Dropout(config.dropout)
+        self.n_embd = config.n_embd
 
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.query_matrix = nn.Linear(config.n_embd, config.n_embd)
-        self.key_matrix = nn.Linear(config.n_embd, config.n_embd)
-        self.value_matrix = nn.Linear(config.n_embd, config.n_embd)
-        self.output_matrix = nn.Linear(config.n_embd, config.n_embd)
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
         self.final_attn = MemBlock(config)
-
         self.gate_bias = nn.Parameter(torch.randn(config.n_head, 1, 1))
         self.topk_retrieved_memories = config.topk_retrieved_memories
         self.knn = KNN(config.n_embd, config.max_knn_memories)
@@ -165,41 +173,31 @@ class KNNAttention(nn.Module):
         self, x, # batch_size, sequence_length, embedding_dimension
         xl_memory = None
     ):
-        device = x.device
-        x = self.ln_1(x)
-        queries = self.query_matrix(x)
-        keys = self.key_matrix(x)
-        values = self.value_matrix(x)
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        queries = F.normalize(queries, dim=-1)
-        keys = F.normalize(keys, dim=-1)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         if xl_memory is not None:
-            k_xl, v_xl = xl_memory.unbind(dim = -2) # unstack
-            keys = torch.cat((k_xl, keys), dim = -2) # prepend XL memory
-            values = torch.cat((v_xl, values), dim = -2) # prepend XL memory
+            k_xl, v_xl = xl_memory.unbind(dim = -2) # assume stacked
+            k = torch.cat((k_xl, k), dim = -2) # prepend XL memory
+            v = torch.cat((v_xl, v), dim = -2) # prepend XL memory
             xl_sequence_length = k_xl.shape[1]
 
-        ### LOCAL ATTENTION
-        queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.n_head)
-        keys    = rearrange(keys, 'b t (h d) -> b h t d', h = self.n_head)
-        qk      = einsum(queries, keys, 'b h i d, b h j d -> b h i j')
-
-        i, j = qk.shape[-2:]
-        if relative_positions is not None:
-            qk = relative_positions[..., -i:, -j:] + qk
-
-        qk = qk * self.scale
-
-        mask = torch.ones((i,j), dtype = torch.bool, device=device).triu(j-i+1) ########
-        qk = qk.masked_fill(mask, float('-inf'))
-
-        qk = F.softmax(qk, dim=-1)
-
-        qk = self.dropout(qk)
-
-        values = rearrange(values, 'b t (h d) -> b h t d', h=self.n_head)
-        qkv = qk@values
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
         ### KNN ATTENTION
         # If there are knn memories (we're not on the first segment) then perform knn attention
@@ -207,7 +205,7 @@ class KNNAttention(nn.Module):
             t1 = time.time()
             print ("Begin KNN operations")
             # Convert queries to search form
-            queries = rearrange(queries, 'b h t d -> b t (h d)')
+            queries = rearrange(q, 'b h t d -> b t (h d)')
             mem_kv = self.knn.search(queries, topk = self.topk_retrieved_memories) # returns b t k 2 d
             mem_k, mem_v = mem_kv.unbind(dim = -2)
             mem_k = rearrange(mem_k, 'b t k (h d) -> b h t k d', h = self.n_head)
@@ -216,37 +214,35 @@ class KNNAttention(nn.Module):
             # Convert queries to attention form
             queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.n_head)
             mem_qk = einsum(queries, mem_k, 'b h t d, b h t k d -> b h t k')
-            mem_qk = mem_qk * self.scale
+            mem_qk = mem_qk * 0.125
 
             mem_qk = F.softmax(mem_qk, dim = -1)
-            mem_qk = self.dropout(mem_qk)
+            mem_qk = self.resid_dropout(mem_qk)
             mem_qkv = einsum(mem_qk, mem_v, 'b h t k, b h t k d -> b h t d')
 
             # Combined attentions
-            combined_qkv = mem_qkv * self.gate_bias + qkv * (1 - self.gate_bias)
+            combined_qkv = mem_qkv * self.gate_bias + y * (1 - self.gate_bias)
             combined_qkv = rearrange(combined_qkv, 'b h t d -> b t (h d)')
-            out = self.output_matrix(combined_qkv)
+            out = self.resid_dropout(self.c_proj(combined_qkv))
             t2 = time.time()
             print ("End KNN operations, time taken:", t2 - t1)
         else:
-            qkv = rearrange(qkv, 'b h t d -> b t (h d)')
-            out = self.output_matrix(qkv)
+            y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            # output projection
+            out = self.c_proj(y)
             out = self.final_attn(out)
+            out = self.resid_dropout(out)
 
-        # New XL memories
-        keys = rearrange(keys, 'b h t d -> b t (h d)', h = self.n_head)
-        values = rearrange(values, 'b h t d -> b t (h d)', h = self.n_head)
-        kv_memories = torch.stack((keys, values), dim=-2) # (batch, sequence_len, 2, dimension)
+        # new XL memories
+        k = rearrange(k, 'b h t d -> b t (h d)', h = self.n_head)
+        v = rearrange(v, 'b h t d -> b t (h d)', h = self.n_head)
+        kv_memories = torch.stack((k, v), dim=-2) # (batch, sequence_len, 2, dimension)
 
         if xl_memory is not None:
-            # if we're on a middle/end segment of a document (there are previous XL memories)
-            _, current_kv = kv_memories[:, :-xl_sequence_length], kv_memories[:, -xl_sequence_length:]
-        else:
-            # if we're at the first segment
-            current_kv = kv_memories
+            _, kv_memories = kv_memories[:, :-xl_sequence_length], kv_memories[:, -xl_sequence_length:]
 
-        self.knn.add(current_kv)
-        return out, current_kv
+        self.knn.add(kv_memories)
+        return out, kv_memories
 
 # Multi level perceptron
 class MLP(nn.Module):
