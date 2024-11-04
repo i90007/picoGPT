@@ -1,5 +1,5 @@
 """
-This training script for running on a single gpu 
+This training script for running on a single gpu
 """
 import os
 import time
@@ -16,7 +16,7 @@ eval_interval = 2000
 eval_iters = 200
 init_from = 'scratch' # 'scratch' or 'resume'
 # data
-dataset = 'openwebtext'
+dataset = '' # 'openwebtext'
 gradient_accumulation_steps = 64 # used to simulate larger batch sizes
 batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size (8 for T4 on Google Colab)
 # adamw optimizer
@@ -37,7 +37,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 GPTConfig = {
-    "block_size": 512, # how far back does the model look? i.e. context size
+    "block_size": 128, # (512) how far back does the model look? i.e. context size
     "vocab_size": 50304, # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     "n_layer": 12, # size of the model
     "n_head": 12, # size of the model
