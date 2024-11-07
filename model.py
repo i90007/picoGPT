@@ -49,19 +49,21 @@ class CausalSelfAttention(nn.Module):
         self, x, # batch_size, block_size, n_embd
         xl_memory = None
     ):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
         if xl_memory is not None:
-            k_xl, v_xl = xl_memory.unbind(dim = -2) # assume stacked
-            k = torch.cat((k_xl, k), dim = -2) # prepend XL memory
-            v = torch.cat((v_xl, v), dim = -2) # prepend XL memory
+            B, T, C = xl_memory.size()
+            q, k_xl, v  = self.c_attn(x).split(self.n_embd, dim=2)
+            k = k_xl.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
             xl_sequence_length = k_xl.shape[1]
+        else:
+            B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+            # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -144,7 +146,7 @@ class KNN():
 
 # k-nearest-neibhor attention block for the external memory
 class KNNAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, knn):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
@@ -164,28 +166,27 @@ class KNNAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-        self.final_attn = MemBlock(config)
         self.gate_bias = nn.Parameter(torch.randn(config.n_head, 1, 1))
-        self.topk_retrieved_memories = config.topk_retrieved_memories
-        self.knn = KNN(config.n_embd, config.max_knn_memories)
+        self.knn = knn
 
     def forward(
         self, x, # batch_size, sequence_length, embedding_dimension
         xl_memory = None
     ):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
         if xl_memory is not None:
-            k_xl, v_xl = xl_memory.unbind(dim = -2) # assume stacked
-            k = torch.cat((k_xl, k), dim = -2) # prepend XL memory
-            v = torch.cat((v_xl, v), dim = -2) # prepend XL memory
+            B, T, C = xl_memory.size()
+            q, k_xl, v  = self.c_attn(x).split(self.n_embd, dim=2)
+            k = k_xl.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             xl_sequence_length = k_xl.shape[1]
+        else:
+            B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+            # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -206,7 +207,7 @@ class KNNAttention(nn.Module):
             print ("Begin KNN operations")
             # Convert queries to search form
             queries = rearrange(q, 'b h t d -> b t (h d)')
-            mem_kv = self.knn.search(queries, topk = self.topk_retrieved_memories) # returns b t k 2 d
+            mem_kv = self.knn.search(queries, topk = 3) # returns b t k 2 d
             mem_k, mem_v = mem_kv.unbind(dim = -2)
             mem_k = rearrange(mem_k, 'b t k (h d) -> b h t k d', h = self.n_head)
             mem_v = rearrange(mem_v, 'b t k (h d) -> b h t k d', h = self.n_head)
@@ -230,7 +231,6 @@ class KNNAttention(nn.Module):
             y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
             # output projection
             out = self.c_proj(y)
-            out = self.final_attn(out)
             out = self.resid_dropout(out)
 
         # new XL memories
@@ -283,13 +283,14 @@ class MemorizingGPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.knn = KNN(config.n_embd, config.max_knn_memories)
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([MemBlock(config) for _ in range(config.n_layer)]),
-            knn_attention = KNNAttention(config),            
+            h = nn.ModuleList([MemBlock(config) for _ in range(config.n_layer - 1)]),
+            knn_attention = KNNAttention(config, self.knn),         
             ln_f = LayerNorm(config.n_embd, bias=config.bias)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -323,15 +324,14 @@ class MemorizingGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, xl_memory=None, targets=None):
+    def forward(self, idx, targets=None, xl_memories=None):
         # If no XL memories (start of a sequence) then None type for each layer.
         # There is one set of XL memories for each layer
         # xl_memories = default(xl_memories, (None,) * self.num_xl_memory_layers)
-        if xl_memory is None:
-            xl_memory = (None,) * self.config.n_embd
+        if xl_memories is None:
+            xl_memories = (None,) * self.config.n_layer
         # Iterator
-        xl_memories_iter = iter(xl_memory)
-
+        xl_memories_iter = iter(xl_memories)
         # Embeddings
         device = idx.device
         b, t = idx.size()
@@ -345,9 +345,11 @@ class MemorizingGPT(nn.Module):
 
         # Store the XL memories for each pass
         new_memories = []
-        for i, block in enumerate(self.transformer):
+        for i, block in enumerate(self.transformer.h):
             if i == self.config.n_layer - 2:
                 x, xl_mem = self.transformer.knn_attention(x, next(xl_memories_iter))
+                new_memories.append(xl_mem.detach())
+                x, xl_mem = block(x, next(xl_memories_iter))
             else:
                 x, xl_mem = block(x, next(xl_memories_iter))
 
