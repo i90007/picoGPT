@@ -16,12 +16,12 @@ eval_interval = 2000
 eval_iters = 200
 init_from = 'scratch' # 'scratch' or 'resume'
 # data
-dataset = '' # 'openwebtext'
+dataset = 'tinyshakespeare' # 'openwebtext'
 gradient_accumulation_steps = 64 # used to simulate larger batch sizes
-batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size (8 for T4 on Google Colab)
+batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size (8 for openwebtext and T4 on Google Colab)
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 200 # total number of training iterations (600000)
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -29,25 +29,30 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+lr_decay_iters = 200 # should be ~= max_iters per Chinchilla (600000)
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+# attempt to autodetect device
+device = "cpu" # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"using device: {device}")
+# 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+compile = True if device == "cuda" else False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
-GPTConfig = {
-    "block_size": 128, # (512) how far back does the model look? i.e. context size
-    "vocab_size": 50304, # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    "n_layer": 12, # size of the model
-    "n_head": 12, # size of the model
-    "n_embd": 768, # size of the model
-    "dropout": 0.1, # for determinism
-    "bias": True, # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+class GPTConfig:
+    block_size: int = 128 # (512) how far back does the model look? i.e. context size
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12 # size of the model
+    n_head: int = 12 # size of the model
+    n_embd: int = 768 # size of the model
+    dropout: float = 0.1 # for determinism
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    max_knn_memories: bool = 81920 # the maximum number of memories that will be stored locally
 
-}
 # we are running on a single gpu, and one process
-master_process = True
 tokens_per_iter = gradient_accumulation_steps * batch_size * GPTConfig.block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
@@ -132,10 +137,12 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        logits = None
+        model.knn.clear()
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                _, loss = model(X, Y)
+                logits, loss = model(X, Y, xl_memories = logits)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -167,7 +174,7 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if losses['val'] < best_val_loss:
@@ -182,11 +189,15 @@ while True:
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
 
+    # Clear XL memories
+    logits = None
+    # Clear KNN memory
+    model.knn.clear()
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss = model(X, Y, xl_memories=logits)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -209,8 +220,6 @@ while True:
     # get loss as float. note: this is a CPU-GPU sync point
     # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
     lossf = loss.item() * gradient_accumulation_steps
-    if local_iter_num >= 5: # let the training loop settle a bit
-        mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
     print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
 
     iter_num += 1
