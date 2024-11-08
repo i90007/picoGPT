@@ -50,14 +50,16 @@ class CausalSelfAttention(nn.Module):
         xl_memory = None
     ):
         if xl_memory is not None:
-            B, T, C = xl_memory.size()
-            q, k_xl, v  = self.c_attn(x).split(self.n_embd, dim=2)
-            k = k_xl.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            B, T, M, C = xl_memory.size()
+            xl_memory = xl_memory.view(B*M, T, C)
+            q, k_xl, v  = self.c_attn(xl_memory).split(self.n_embd, dim=2)
+            k = k_xl.view(B*M, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q = q.view(B*M, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B*M, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
             xl_sequence_length = k_xl.shape[1]
         else:
+            M = 1
             B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
             # calculate query, key, values for all heads in batch and move head forward to be the batch dim
             q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
@@ -76,7 +78,7 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B*M, T, C) # re-assemble all head outputs side by side
 
         # output projection
         out = self.resid_dropout(self.c_proj(y))
@@ -104,10 +106,13 @@ class KNN():
     def add_to_db(self, new_data):
         new_data_len = new_data.shape[0]
         ids = (np.arange(new_data_len) + self.db_offset)
-        self.db[ids] = new_data.detach().cpu().numpy()
-        self.db_offset += new_data_len
-        # Write to file
-        self.db.flush()
+        if self.max_memories > new_data_len + self.db_offset:
+            self.db[ids] = new_data.detach().cpu().numpy()
+            self.db_offset += new_data_len
+            # Write to file
+            self.db.flush()
+        else:
+            self.clear()
 
     def search_and_retrieve(self, query_vecs, topk):
         query_vecs = query_vecs
@@ -133,7 +138,7 @@ class KNN():
         device = query_vecs.device
         # Input is b n d, flatten to (b n) d
         query_vecs = query_vecs.flatten(0,1)
-        kvs = self.search_and_retrieve(np.ascontiguousarray(query_vecs.detach().cpu().numpy()), topk) ######
+        kvs = self.search_and_retrieve(np.ascontiguousarray(query_vecs.detach().cpu().numpy()), topk)
         # kvs are (b n) k 2 d, unflatten to b n k 2 d
         kvs = torch.tensor(kvs)
         kvs = torch.unflatten(kvs, 0, (query_batch_size, query_seq_len))
@@ -174,11 +179,12 @@ class KNNAttention(nn.Module):
         xl_memory = None
     ):
         if xl_memory is not None:
-            B, T, C = xl_memory.size()
-            q, k_xl, v  = self.c_attn(x).split(self.n_embd, dim=2)
-            k = k_xl.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            B, T, M, C = xl_memory.size()
+            xl_memory = xl_memory.view(B*M, T, C)
+            q, k_xl, v  = self.c_attn(xl_memory).split(self.n_embd, dim=2)
+            k = k_xl.view(B*M, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q = q.view(B*M, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B*M, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             xl_sequence_length = k_xl.shape[1]
         else:
             B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -362,7 +368,8 @@ class MemorizingGPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            B, T, C = logits.size()
+            loss = F.cross_entropy(logits.view(T, C*B), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
