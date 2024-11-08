@@ -12,7 +12,7 @@ from model import MemorizingGPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 200 # 2000
 eval_iters = 200
 init_from = 'scratch' # 'scratch' or 'resume'
 # data
@@ -28,7 +28,7 @@ beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
+warmup_iters = 200 # how many steps to warm up for (2000)
 lr_decay_iters = 200 # should be ~= max_iters per Chinchilla (600000)
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # attempt to autodetect device
