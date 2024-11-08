@@ -50,7 +50,7 @@ class GPTConfig:
     n_embd: int = 768 # size of the model
     dropout: float = 0.1 # for determinism
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    max_knn_memories: bool = 81920 # the maximum number of memories that will be stored locally
+    max_knn_memories: bool = 130943 # the maximum number of memories that will be stored locally
 
 # we are running on a single gpu, and one process
 tokens_per_iter = gradient_accumulation_steps * batch_size * GPTConfig.block_size
