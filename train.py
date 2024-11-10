@@ -14,7 +14,7 @@ from model import MemorizingGPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 200 # 2000
+eval_interval = 200 # 2000 for openwebtext, 200 for tinyshakespeare
 eval_iters = 200
 init_from = 'scratch' # 'scratch' or 'resume'
 # data
@@ -23,15 +23,15 @@ gradient_accumulation_steps = 64 # used to simulate larger batch sizes
 batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size (8 for openwebtext and T4 on Google Colab)
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 200 # total number of training iterations (600000)
+max_iters = 200 # total number of training iterations (600000 for openwebtext, 200 for tinyshakespeare)
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 200 # how many steps to warm up for (2000)
-lr_decay_iters = 200 # should be ~= max_iters per Chinchilla (600000)
+warmup_iters = 20 # how many steps to warm up for (2000 for openwebtext, 20 for tinyshakespeare)
+lr_decay_iters = 200 # should be ~= max_iters per Chinchilla (600000 for openwebtext, 200 for tinyshakespeare)
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # attempt to autodetect device
 device = "cpu" # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
