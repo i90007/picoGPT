@@ -8,10 +8,10 @@ import numpy as np
 import math
 import inspect
 import time
-#!conda install einops
 from einops import rearrange, einsum
 #!conda install faiss-gpu
 import faiss
+from torch.compiler import allow_in_graph
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -20,7 +20,10 @@ class LayerNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
     def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        B, T, C = input.size()
+        if T != self.weight.shape[0]:
+            B, C, T = input.size()
+        return F.layer_norm(input.view(B, C, T), self.weight.shape, self.weight, self.bias, 1e-5)
 
 
 class CausalSelfAttention(nn.Module):
@@ -93,6 +96,10 @@ class CausalSelfAttention(nn.Module):
 
         return out, kv_memories
 
+@allow_in_graph
+def add_to_faiss_index(n_embd):
+    return faiss.IndexFlatL2(n_embd)
+
 # k-nearest-neibhor layer for the external memory
 class KNN():
     def __init__(self, n_embd, max_memories):
@@ -101,7 +108,7 @@ class KNN():
         self.db_offset = 0
         self.db_filepath = "./memory.memmap"
         self.db = np.memmap(self.db_filepath, mode = 'w+', dtype = np.float32, shape = self.shape)
-        self.index = faiss.IndexFlatL2(n_embd)
+        self.index = add_to_faiss_index(n_embd)
 
     def add_to_db(self, new_data):
         new_data_len = new_data.shape[0]
@@ -277,10 +284,8 @@ class MemBlock(nn.Module):
 
     def forward(self, x, xl_memory):
         attn_out, new_xl_memories = self.attn(self.ln_1(x), xl_memory=xl_memory)
-        x = x + attn_out
-
-        x = x + self.mlp(self.ln_2(x))
-        return x, new_xl_memories
+        mlp = self.mlp(self.ln_2(attn_out))
+        return mlp, new_xl_memories
 
 
 class MemorizingGPT(nn.Module):  
@@ -369,7 +374,11 @@ class MemorizingGPT(nn.Module):
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             B, T, C = logits.size()
-            loss = F.cross_entropy(logits.view(T, C*B), targets.view(-1), ignore_index=-1)
+            logits = logits.view(T*B, C)
+            targets = targets.view(-1)
+            if logits.size(0) > targets.size(0):
+              logits = logits[-targets.size(0):]
+            loss = F.cross_entropy(logits, targets, ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
