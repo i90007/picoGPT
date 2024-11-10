@@ -45,7 +45,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True if device == "cuda" else False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 class GPTConfig:
-    block_size: int = 128 # (512) how far back does the model look? i.e. context size
+    block_size: int = 512 # (512) how far back does the model look? i.e. context size
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12 # size of the model
     n_head: int = 12 # size of the model
