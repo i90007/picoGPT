@@ -1,5 +1,5 @@
 """
-This training script for running on a single gpu
+The training script for running on a single gpu
 """
 import os
 import time
@@ -20,7 +20,7 @@ init_from = 'scratch' # 'scratch' or 'resume'
 # data
 dataset = 'tinyshakespeare' # 'openwebtext'
 gradient_accumulation_steps = 64 # used to simulate larger batch sizes
-batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size (8 for openwebtext and T4 on Google Colab)
+batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size (8 for openwebtext and T4 on Google Colab)
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 200 # total number of training iterations (600000 for openwebtext, 200 for tinyshakespeare)
