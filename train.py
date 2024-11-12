@@ -8,6 +8,8 @@ from contextlib import nullcontext
 import numpy as np
 
 import torch
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 # import sys
 # sys.exit()
 from model import MemorizingGPT
@@ -20,7 +22,7 @@ init_from = 'scratch' # 'scratch' or 'resume'
 # data
 dataset = 'tinyshakespeare' # 'openwebtext'
 gradient_accumulation_steps = 64 # used to simulate larger batch sizes
-batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size (8 for openwebtext and T4 on Google Colab)
+batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size (8 for openwebtext and T4 on Google Colab)
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 200 # total number of training iterations (600000 for openwebtext, 200 for tinyshakespeare)
@@ -41,7 +43,7 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
 # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = True if device == "cuda" else False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 class GPTConfig:
