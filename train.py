@@ -16,8 +16,8 @@ from model import MemorizingGPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 200 # 2000 for openwebtext, 200 for tinyshakespeare
-eval_iters = 20 # 200 for openwebtext, 20 for tinyshakespeare
+eval_interval = 20 # 2000 for openwebtext, 20 for tinyshakespeare
+eval_iters = 2 # 200 for openwebtext, 2 for tinyshakespeare
 init_from = 'scratch' # 'scratch' or 'resume'
 # data
 dataset = 'tinyshakespeare' # 'openwebtext'
@@ -32,7 +32,7 @@ beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 20 # how many steps to warm up for (2000 for openwebtext, 20 for tinyshakespeare)
+warmup_iters = 2 # how many steps to warm up for (2000 for openwebtext, 2 for tinyshakespeare)
 lr_decay_iters = 200 # should be ~= max_iters per Chinchilla (600000 for openwebtext, 200 for tinyshakespeare)
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # attempt to autodetect device
@@ -43,7 +43,7 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
 # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = True if device == "cuda" else False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 class GPTConfig:

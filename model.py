@@ -244,8 +244,10 @@ class KNNAttention(nn.Module):
             t2 = time.time()
             print ("End KNN operations, time taken:", t2 - t1)
         else:
-            y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-            # output projection
+            if xl_memory is not None:
+                y = y.transpose(1, 2).contiguous().view(B*M, T, C) # re-assemble all head outputs side by side
+            else:
+                y = y.transpose(1, 2).contiguous().view(B, T, C)
             out = self.c_proj(y)
             out = self.resid_dropout(out)
 
