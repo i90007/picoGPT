@@ -1,5 +1,5 @@
 """
-This training script for running on a single gpu
+The training script for running on a single gpu
 """
 import os
 import time
@@ -8,6 +8,8 @@ from contextlib import nullcontext
 import numpy as np
 
 import torch
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 # import sys
 # sys.exit()
 from model import MemorizingGPT
@@ -41,7 +43,7 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
 # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = True if device == "cuda" else False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 class GPTConfig:
