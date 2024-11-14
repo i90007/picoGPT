@@ -100,7 +100,7 @@ class CausalSelfAttention(nn.Module):
 def add_to_faiss_index(n_embd):
     return faiss.IndexFlatL2(n_embd)
 
-# k-nearest-neibhor layer for the external memory
+# k-nearest-neighbor layer for the external memory
 class KNN():
     def __init__(self, n_embd, max_memories):
         self.max_memories = max_memories
