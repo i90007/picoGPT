@@ -141,13 +141,12 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
-        logits = None
         model.knn.clear()
         for k in range(eval_iters):
             print(f'Estimate_loss - {k} from {eval_iters}')
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y, xl_memories = logits)
+                _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
