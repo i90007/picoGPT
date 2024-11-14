@@ -15,12 +15,12 @@ from model import MemorizingGPT
 # I/O
 out_dir = 'out'
 eval_interval = 200 # 2000 for openwebtext, 200 for tinyshakespeare
-eval_iters = 200
+eval_iters = 20 # 200 for openwebtext, 20 for tinyshakespeare
 init_from = 'scratch' # 'scratch' or 'resume'
 # data
 dataset = 'tinyshakespeare' # 'openwebtext'
 gradient_accumulation_steps = 64 # used to simulate larger batch sizes
-batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size (8 for openwebtext and T4 on Google Colab)
+batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size (16 for tinyshakespeare and TPU on Google Colab)
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 200 # total number of training iterations (600000 for openwebtext, 200 for tinyshakespeare)
@@ -142,6 +142,7 @@ def estimate_loss():
         logits = None
         model.knn.clear()
         for k in range(eval_iters):
+            print(f'Estimate_loss - {k} from {eval_iters}')
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y, xl_memories = logits)
@@ -168,8 +169,8 @@ def get_lr(it):
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-while True:
 
+while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:

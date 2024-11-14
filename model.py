@@ -103,7 +103,6 @@ def add_to_faiss_index(n_embd):
 # k-nearest-neibhor layer for the external memory
 class KNN():
     def __init__(self, n_embd, max_memories):
-        self.max_memories = max_memories
         self.shape = (max_memories, 2, n_embd)
         self.db_offset = 0
         self.db_filepath = "./memory.memmap"
@@ -113,16 +112,12 @@ class KNN():
     def add_to_db(self, new_data):
         new_data_len = new_data.shape[0]
         ids = (np.arange(new_data_len) + self.db_offset)
-        if self.max_memories > new_data_len + self.db_offset:
-            self.db[ids] = new_data.detach().cpu().numpy()
-            self.db_offset += new_data_len
-            # Write to file
-            self.db.flush()
-        else:
-            self.clear()
+        self.db[ids] = new_data.detach().cpu().numpy()
+        self.db_offset += new_data_len
+        # Write to file
+        self.db.flush()
 
     def search_and_retrieve(self, query_vecs, topk):
-        query_vecs = query_vecs
         _, indices = self.index.search(query_vecs, topk)
         kvs = self.db[indices]
         return kvs
@@ -161,6 +156,7 @@ class KNNAttention(nn.Module):
     def __init__(self, config, knn):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.max_memories = config.max_knn_memories
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
@@ -215,6 +211,8 @@ class KNNAttention(nn.Module):
 
         ### KNN ATTENTION
         # If there are knn memories (we're not on the first segment) then perform knn attention
+        if self.knn.index.ntotal >= self.max_memories:
+            self.knn.clear()
         if self.knn.index.ntotal > 0:
             t1 = time.time()
             print ("Begin KNN operations")
