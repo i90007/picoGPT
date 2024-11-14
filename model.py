@@ -103,6 +103,7 @@ def add_to_faiss_index(n_embd):
 # k-nearest-neibhor layer for the external memory
 class KNN():
     def __init__(self, n_embd, max_memories):
+        self.max_memories = max_memories
         self.shape = (max_memories, 2, n_embd)
         self.db_offset = 0
         self.db_filepath = "./memory.memmap"
@@ -112,10 +113,13 @@ class KNN():
     def add_to_db(self, new_data):
         new_data_len = new_data.shape[0]
         ids = (np.arange(new_data_len) + self.db_offset)
-        self.db[ids] = new_data.detach().cpu().numpy()
-        self.db_offset += new_data_len
-        # Write to file
-        self.db.flush()
+        if self.max_memories > new_data_len + self.db_offset:
+            self.db[ids] = new_data.detach().cpu().numpy()
+            self.db_offset += new_data_len
+            # Write to file
+            self.db.flush()
+        else:
+            self.clear()
 
     def search_and_retrieve(self, query_vecs, topk):
         _, indices = self.index.search(query_vecs, topk)
