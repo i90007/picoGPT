@@ -1,5 +1,12 @@
 """
 The training script for running on a single gpu
+Little logs:
+1) block_size = 512
+tokens per iteration will be: 7,680
+number of parameters: 118.96M
+iter 187: loss 6.3322
+For T4 on Google Colab (tinyshakespeare) should be: gradient_accumulation_steps = 5 and batch_size = 3
+2) ...
 """
 import os
 import time
@@ -21,11 +28,11 @@ eval_iters = 2 # 200 for openwebtext, 2 for tinyshakespeare
 init_from = 'scratch' # 'scratch' or 'resume'
 # data
 dataset = 'tinyshakespeare' # 'openwebtext'
-gradient_accumulation_steps = 64 # used to simulate larger batch sizes
-batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size (16 for tinyshakespeare and TPU on Google Colab)
+gradient_accumulation_steps = 5 # used to simulate larger batch sizes (5 for tinyshakespeare and TP4 on Google Colab)
+batch_size = 3 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 200 # total number of training iterations (600000 for openwebtext, 200 for tinyshakespeare)
+max_iters = 100 # total number of training iterations (600000 for openwebtext, 200 for tinyshakespeare)
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -33,7 +40,7 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2 # how many steps to warm up for (2000 for openwebtext, 2 for tinyshakespeare)
-lr_decay_iters = 200 # should be ~= max_iters per Chinchilla (600000 for openwebtext, 200 for tinyshakespeare)
+lr_decay_iters = 100 # should be ~= max_iters per Chinchilla (600000 for openwebtext, 200 for tinyshakespeare)
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # attempt to autodetect device
 device = "cpu" # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -47,7 +54,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True if device == "cuda" else False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 class GPTConfig:
-    block_size: int = 512 # (512) how far back does the model look? i.e. context size
+    block_size: int = 1024 # (1024) how far back does the model look? i.e. context size
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12 # size of the model
     n_head: int = 12 # size of the model
@@ -187,11 +194,11 @@ while True:
                 checkpoint = {
                     'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
+                    'iter_num': iter_num
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                checkpoint_loss = round(best_val_loss * 10000)
+                torch.save(checkpoint, os.path.join(out_dir, f"val_loss__0_{checkpoint_loss}.pt"))
 
     # Clear XL memories
     logits = None
