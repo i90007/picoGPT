@@ -23,7 +23,7 @@ from model import MemorizingGPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 20 # 2000 for openwebtext, 20 for tinyshakespeare
+eval_interval = 10 # 2000 for openwebtext, 20 for tinyshakespeare
 eval_iters = 2 # 200 for openwebtext, 2 for tinyshakespeare
 init_from = 'scratch' # 'scratch' or 'resume'
 # data
