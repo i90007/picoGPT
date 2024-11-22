@@ -2,11 +2,38 @@
 The training script for running on a single gpu
 Little logs:
 1) block_size = 512
+dropout = 0.1
 tokens per iteration will be: 7,680
 number of parameters: 118.96M
 iter 187: loss 6.3322
 For T4 on Google Colab (tinyshakespeare) should be: gradient_accumulation_steps = 5 and batch_size = 3
-2) ...
+2) block_size = 1024
+dropout = 0.1
+tokens per iteration will be: 8,192
+number of parameters: 118.96M
+iter 150: loss 6.3291
+For T4 on Google Colab should be: gradient_accumulation_steps = 4 and batch_size = 2
+3) block_size = 512
+dropout = 0.1
+tokens per iteration will be: 4,096
+number of parameters: 345.42M
+iter 150: loss 6.6170
+For T4 on Google Colab should be: gradient_accumulation_steps = 4 and batch_size = 2
+4) block_size = 1024
+dropout = 0.2
+number of parameters: 345.42M
+iter 40: loss 6.4772
+For T4 on Google Colab should be: gradient_accumulation_steps = 4 and batch_size = 1
+5) block_size = 512
+dropout = 0.5
+number of parameters: 759.66M
+iter 100: loss 6.3455
+For T4 on Google Colab should be: gradient_accumulation_steps = 2 and batch_size = 1
+6) block_size = 1024
+dropout = 0.5
+number of parameters: 759.66M
+iter 150: loss 6.8028
+For T4 on Google Colab should be: gradient_accumulation_steps = 1 and batch_size = 1
 """
 import os
 import time
@@ -28,19 +55,19 @@ eval_iters = 2 # 200 for openwebtext, 2 for tinyshakespeare
 init_from = 'scratch' # 'scratch' or 'resume'
 # data
 dataset = 'tinyshakespeare' # 'openwebtext'
-gradient_accumulation_steps = 5 # used to simulate larger batch sizes (5 for tinyshakespeare and TP4 on Google Colab)
-batch_size = 3 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 1 # used to simulate larger batch sizes (4 for tinyshakespeare and TP4 on Google Colab)
+batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 100 # total number of training iterations (600000 for openwebtext, 200 for tinyshakespeare)
+max_iters = 200 # total number of training iterations (600000 for openwebtext, 200 for tinyshakespeare)
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2 # how many steps to warm up for (2000 for openwebtext, 2 for tinyshakespeare)
-lr_decay_iters = 100 # should be ~= max_iters per Chinchilla (600000 for openwebtext, 200 for tinyshakespeare)
+warmup_iters = 1 # how many steps to warm up for (2000 for openwebtext, 2 for tinyshakespeare)
+lr_decay_iters = 200 # should be ~= max_iters per Chinchilla (600000 for openwebtext, 200 for tinyshakespeare)
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # attempt to autodetect device
 device = "cpu" # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -56,10 +83,10 @@ compile = True if device == "cuda" else False # use PyTorch 2.0 to compile the m
 class GPTConfig:
     block_size: int = 1024 # (1024) how far back does the model look? i.e. context size
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12 # size of the model
-    n_head: int = 12 # size of the model
-    n_embd: int = 768 # size of the model
-    dropout: float = 0.1 # for determinism
+    n_layer: int = 36 # size of the model
+    n_head: int = 20 # size of the model
+    n_embd: int = 1280 # size of the model
+    dropout: float = 0.5 # for determinism
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     max_knn_memories: bool = 130943 # the maximum number of memories that will be stored locally
 
@@ -198,7 +225,7 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 checkpoint_loss = round(best_val_loss * 10000)
-                torch.save(checkpoint, os.path.join(out_dir, f"val_loss__0_{checkpoint_loss}.pt"))
+                torch.save(checkpoint, os.path.join(out_dir, f"val_loss__{checkpoint_loss}.pt"))
 
     # Clear XL memories
     logits = None
