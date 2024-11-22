@@ -1,6 +1,8 @@
 """
 Full definition of the Language Model, all of it in this single file.
 """
+import logging
+from itertools import repeat
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -44,9 +46,8 @@ class CausalSelfAttention(nn.Module):
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+            from torch.nn.functional import causal_mask
+            self.register_buffer("bias", causal_mask(config.block_size))
 
     def forward(
         self, x, # batch_size, block_size, n_embd
@@ -78,9 +79,13 @@ class CausalSelfAttention(nn.Module):
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
+            if att.size(-1) > 1:
+                att = F.softmax(att, dim=-1)
+                att = self.attn_dropout(att)
+            else:
+                att = torch.ones_like(att)  # When the sequence length is 1, softmax is redundant
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
         y = y.transpose(1, 2).contiguous().view(B*M, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -103,6 +108,7 @@ def add_to_faiss_index(n_embd):
 # k-nearest-neighbor layer for the external memory
 class KNN():
     def __init__(self, n_embd, max_memories):
+        self.logger = logging.getLogger("KNN")
         self.max_memories = max_memories
         self.shape = (max_memories, 2, n_embd)
         self.db_offset = 0
@@ -112,18 +118,22 @@ class KNN():
 
     def add_to_db(self, new_data):
         new_data_len = new_data.shape[0]
-        ids = (np.arange(new_data_len) + self.db_offset)
-        if self.max_memories > new_data_len + self.db_offset:
-            self.db[ids] = new_data.detach().cpu().numpy()
-            self.db_offset += new_data_len
-            # Write to file
-            self.db.flush()
-        else:
+        if self.db_offset + new_data_len > self.max_memories:
+            self.logger.warning("Memory limit reached. Clearing database.")
             self.clear()
+        ids = np.arange(new_data_len) + self.db_offset
+        self.db[ids % self.max_memories] = new_data.detach().cpu().numpy()
+        self.db_offset += new_data_len
+        # Write to file
+        self.db.flush()
 
     def search_and_retrieve(self, query_vecs, topk):
+        start_time = time.time()
         _, indices = self.index.search(query_vecs, topk)
         kvs = self.db[indices]
+
+        elapsed_time = time.time() - start_time
+        self.logger.info(f"KNN search completed in {elapsed_time:.4f}s for top-{topk}")
         return kvs
 
     def add(self, new_data):
@@ -186,6 +196,9 @@ class KNNAttention(nn.Module):
         self, x, # batch_size, sequence_length, embedding_dimension
         xl_memory = None
     ):
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.INFO)
+
         if xl_memory is not None:
             B, T, M, C = xl_memory.size()
             xl_memory = xl_memory.view(B*M, T, C)
@@ -217,10 +230,11 @@ class KNNAttention(nn.Module):
         ### KNN ATTENTION
         # If there are knn memories (we're not on the first segment) then perform knn attention
         if self.knn.index.ntotal >= self.max_memories:
+            logger.info("Clearing KNN memories due to limit reached.")
             self.knn.clear()
         if self.knn.index.ntotal > 0:
+            logger.info("Begin KNN operations")
             t1 = time.time()
-            print ("Begin KNN operations")
             # Convert queries to search form
             queries = rearrange(q, 'b h t d -> b t (h d)')
             mem_kv = self.knn.search(queries, topk = 3) # returns b t k 2 d
@@ -242,8 +256,9 @@ class KNNAttention(nn.Module):
             combined_qkv = rearrange(combined_qkv, 'b h t d -> b t (h d)')
             out = self.resid_dropout(self.c_proj(combined_qkv))
             t2 = time.time()
-            print ("End KNN operations, time taken:", t2 - t1)
+            logger.info(f"KNN operations completed. Time taken: {t2 - t1:.4f} seconds.")
         else:
+            logger.info("No KNN memories available.")
             if xl_memory is not None:
                 y = y.transpose(1, 2).contiguous().view(B*M, T, C) # re-assemble all head outputs side by side
             else:
@@ -313,7 +328,10 @@ class MemorizingGPT(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
-        self.apply(self._init_weights)
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                self._init_weights(module)
+
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
@@ -333,21 +351,16 @@ class MemorizingGPT(nn.Module):
         return n_params
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
+            if getattr(module, 'bias', None) is not None:
                 torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
 
     def forward(self, idx, targets=None, xl_memories=None):
         # If no XL memories (start of a sequence) then None type for each layer.
-        # There is one set of XL memories for each layer
-        # xl_memories = default(xl_memories, (None,) * self.num_xl_memory_layers)
-        if xl_memories is None:
-            xl_memories = (None,) * self.config.n_layer
-        # Iterator
-        xl_memories_iter = iter(xl_memories)
+        # There is one set of XL memories for each layer    
+        xl_memories_iter = iter(xl_memories or repeat(None, self.config.n_layer))
         # Embeddings
         device = idx.device
         b, t = idx.size()
@@ -361,13 +374,16 @@ class MemorizingGPT(nn.Module):
 
         # Store the XL memories for each pass
         new_memories = []
+        xl_mem = None
         for i, block in enumerate(self.transformer.h):
             if i == self.config.n_layer - 2:
                 x, xl_mem = self.transformer.knn_attention(x, next(xl_memories_iter))
                 new_memories.append(xl_mem.detach())
                 x, xl_mem = block(x, next(xl_memories_iter))
-            else:
+            elif i % 2 == 0:
                 x, xl_mem = block(x, next(xl_memories_iter))
+            else:
+                x, _ = block(x, None)
 
             if xl_mem is not None:
                 new_memories.append(xl_mem.detach())
@@ -405,6 +421,7 @@ class MemorizingGPT(nn.Module):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        print(f"Configuring optimizer: learning_rate={learning_rate}")
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -439,15 +456,13 @@ class MemorizingGPT(nn.Module):
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            idx_cond = idx[:, -self.config.block_size:]  # Crop sequence if needed
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
             # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # Faster than multinomial
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
