@@ -3,7 +3,7 @@
 
 ![nanoGPT](assets/nanogpt.jpg)
 
-I made this fork to make it simpler to read and make some improvements, add some new features to Karpathy's [project](https://github.com/karpathy/nanoGPT)
+This is the small Llm from this [repo](https://github.com/KellerJordan/modded-nanogpt)
 
 ## install
 

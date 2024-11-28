@@ -14,92 +14,84 @@ from einops import rearrange, einsum
 #!conda install faiss-gpu
 import faiss
 from torch.compiler import allow_in_graph
+# Use of FlexAttention contributed by @KoszarskyB
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+flex_attention = torch.compile(flex_attention, dynamic=False)
+create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
-    def __init__(self, ndim, bias):
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
+
+
+class CastedLinear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=False)
+    def forward(self, x):
+        return F.linear(x, self.weight.to(x.dtype))
+
+
+class Rotary(torch.nn.Module):
+
+    def __init__(self, dim, base=10000):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
-    def forward(self, input):
-        B, T, C = input.size()
-        if T != self.weight.shape[0]:
-            B, C, T = input.size()
-        return F.layer_norm(input.view(B, C, T), self.weight.shape, self.weight, self.bias, 1e-5)
+        self.dim = dim
+        self.base = base
+        self.inv_freq = None
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            self.inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
+        cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        assert x.ndim == 4 # multihead attention
+        d = x.shape[3]//2
+        x1 = x[..., :d]
+        x2 = x[..., d:]
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat([y1, y2], 3).type_as(x)
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, dim, n_head):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        assert dim % n_head == 0
+        self.n_head = n_head
+        self.c_q = CastedLinear(dim, dim)
+        self.c_k = CastedLinear(dim, dim)
+        self.c_v = CastedLinear(dim, dim)
+        # value residual lambda
+        self.lamb = nn.Parameter(torch.tensor(0.5))
+        # rotary embeddings
+        self.rotary = Rotary(dim // n_head) # dim // n_head = head_dim
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            from torch.nn.functional import causal_mask
-            self.register_buffer("bias", causal_mask(config.block_size))
+        self.c_proj = CastedLinear(dim, dim)
+        self.c_proj.weight.data.zero_() # zero init
 
-    def forward(
-        self, x, # batch_size, block_size, n_embd
-        xl_memory = None
-    ):
-        if xl_memory is not None:
-            B, T, M, C = xl_memory.size()
-            xl_memory = xl_memory.view(B*M, T, C)
-            q, k_xl, v  = self.c_attn(xl_memory).split(self.n_embd, dim=2)
-            k = k_xl.view(B*M, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q = q.view(B*M, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v = v.view(B*M, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-            xl_sequence_length = k_xl.shape[1]
-        else:
-            M = 1
-            B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-            # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            if att.size(-1) > 1:
-                att = F.softmax(att, dim=-1)
-                att = self.attn_dropout(att)
-            else:
-                att = torch.ones_like(att)  # When the sequence length is 1, softmax is redundant
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-
-        y = y.transpose(1, 2).contiguous().view(B*M, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        out = self.resid_dropout(self.c_proj(y))
-
-        # new XL memories
-        k = rearrange(k, 'b h t d -> b t (h d)', h = self.n_head)
-        v = rearrange(v, 'b h t d -> b t (h d)', h = self.n_head)
-        kv_memories = torch.stack((k, v), dim=-2) # (batch, sequence_len, 2, dimension)
-
-        if xl_memory is not None:
-            _, kv_memories = kv_memories[:, :-xl_sequence_length], kv_memories[:, -xl_sequence_length:]
-
-        return out, kv_memories
+    def forward(self, x, v1, block_mask):
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+        q = self.c_q(x).view(B, T, self.n_head, -1)
+        k = self.c_k(x).view(B, T, self.n_head, -1)
+        v = self.c_v(x).view(B, T, self.n_head, -1)
+        if v1 is None:
+            v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
+        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v)
+        q, k = norm(q), norm(k) # QK norm
+        q, k = self.rotary(q), self.rotary(k)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y, v1
 
 @allow_in_graph
 def add_to_faiss_index(n_embd):
@@ -182,13 +174,6 @@ class KNNAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-
         self.gate_bias = nn.Parameter(torch.randn(config.n_head, 1, 1))
         self.knn = knn
 
@@ -215,17 +200,8 @@ class KNNAttention(nn.Module):
             q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # efficient attention using Flash Attention CUDA kernels
+        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
 
         ### KNN ATTENTION
         # If there are knn memories (we're not on the first segment) then perform knn attention
@@ -279,63 +255,55 @@ class KNNAttention(nn.Module):
 
 # Multi level perceptron
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, dim):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        self.c_fc   = CastedLinear(dim, 4 * dim)
+        self.c_proj = CastedLinear(4 * dim, dim)
+        self.c_proj.weight.data.zero_() # zero init
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU
         x = self.c_proj(x)
-        x = self.dropout(x)
         return x
     
 
-class MemBlock(nn.Module):
+class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp  = MLP(config)
+        self.attn = CausalSelfAttention(config.n_embd, config.n_head)
+        self.mlp = MLP(config.n_embd)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, xl_memory):
-        attn_out, new_xl_memories = self.attn(self.ln_1(x), xl_memory=xl_memory)
-        mlp = self.mlp(self.ln_2(attn_out))
-        return mlp, new_xl_memories
+    def forward(self, x, v1, x0, block_mask):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x1, v1 = self.attn(norm(x), v1, block_mask)
+        x = x + x1
+        x = x + self.mlp(norm(x))
+        return x, v1
 
 
 class MemorizingGPT(nn.Module):  
     def __init__(self, config):
         super().__init__()
-        assert config.vocab_size is not None
-        assert config.block_size is not None
-        self.config = config
+        # U-net design
+        self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
+        # "- 1" for KNNAttention
+        self.num_decoder_layers = config.n_layer - self.num_encoder_layers -1 # Remaining for decoder
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+
         self.knn = KNN(config.n_embd, config.max_knn_memories)
+        self.drop = nn.Dropout(config.dropout)
+        self.knn_attention = KNNAttention(config, self.knn)
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([MemBlock(config) for _ in range(config.n_layer - 1)]),
-            knn_attention = KNNAttention(config, self.knn),         
-            ln_f = LayerNorm(config.n_embd, bias=config.bias)
+            # "- 1" for KNNAttention
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer - 1)])
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-
-        # init all weights
-        for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.Embedding)):
-                self._init_weights(module)
-
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.weight.data.zero_()
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -350,102 +318,60 @@ class MemorizingGPT(nn.Module):
         n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if getattr(module, 'bias', None) is not None:
-                torch.nn.init.zeros_(module.bias)
-
-
-    def forward(self, idx, targets=None, xl_memories=None):
-        # If no XL memories (start of a sequence) then None type for each layer.
-        # There is one set of XL memories for each layer    
-        xl_memories_iter = iter(xl_memories or repeat(None, self.config.n_layer))
-        # Embeddings
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+    def forward(self, idx, target=None):
+        docs = (idx == 50304).cumsum(0)
+        def document_causal_mask(_, __, q_idx, kv_idx):
+          causal_mask = q_idx >= kv_idx
+          document_mask = docs[q_idx] == docs[kv_idx]
+          window_mask = q_idx - kv_idx < 1024
+          return causal_mask & document_mask & window_mask
+        
+        S = len(idx)
+        block_mask = create_block_mask(document_causal_mask, None, None, S, S, device=idx.device, _compile=True)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-
-        # Store the XL memories for each pass
-        new_memories = []
+        x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
+        x = F.rms_norm(x, (x.size(-1),))
+        x = self.drop(x)
+        x0 = x
         xl_mem = None
-        for i, block in enumerate(self.transformer.h):
-            if i == self.config.n_layer - 2:
-                x, xl_mem = self.transformer.knn_attention(x, next(xl_memories_iter))
-                new_memories.append(xl_mem.detach())
-                x, xl_mem = block(x, next(xl_memories_iter))
-            elif i % 2 == 0:
-                x, xl_mem = block(x, next(xl_memories_iter))
+
+        # If no XL memories (start of a sequence) then None type for each layer.
+        # There is one set of XL memories for each layer
+        # Store outputs for U-Net skip connections
+        new_memories = []
+        # Encoder pass - process only the first half of the blocks
+        for i in range(self.num_encoder_layers):
+            x, xl_mem = self.transformer.h[i](x, xl_mem, x0, block_mask)
+            new_memories.append(x)
+        # Decoder pass - process the remaining blocks with weighted skip connections
+        for i in range(self.num_decoder_layers):
+            if i == self.num_decoder_layers - 2:
+                x = x + self.skip_weights[i] * new_memories.pop()
+                x, xl_mem = self.knn_attention(x, xl_mem)
+                x, xl_mem = self.transformer.h[self.num_encoder_layers + i](x, xl_mem, x0, block_mask)
             else:
-                x, _ = block(x, None)
+                x = x + self.skip_weights[i] * new_memories.pop()
+                x, xl_mem = self.transformer.h[self.num_encoder_layers + i](x, xl_mem, x0, block_mask)
 
-            if xl_mem is not None:
-                new_memories.append(xl_mem.detach())
-
-        x = self.transformer.ln_f(x)
+        x = F.rms_norm(x, (x.size(-1),))
 
         # Training
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
+        if target is not None:
+            # if we are given some desired target also calculate the loss
             logits = self.lm_head(x)
-            B, T, C = logits.size()
-            logits = logits.view(T*B, C)
-            targets = targets.view(-1)
-            if logits.size(0) > targets.size(0):
-              logits = logits[-targets.size(0):]
-            loss = F.cross_entropy(logits, targets, ignore_index=-1)
+            logits = 30 * torch.tanh(logits / 30)
+            logits = logits.float()
+            # B, T, C = logits.size()
+            # logits = logits.view(T*B, C)
+            target = target.view(-1)
+            if logits.size(0) > target.size(0):
+              logits = logits[-target.size(0):]
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target, ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        if len(new_memories) > 0:
-            return new_memories, loss
-        return logits, loss
-    
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        print(f"Configuring optimizer: learning_rate={learning_rate}")
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-        
-        return optimizer
+        return loss
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=0.9):
@@ -455,10 +381,8 @@ class MemorizingGPT(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx[:, -self.config.block_size:]  # Crop sequence if needed
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # sample from the distribution
