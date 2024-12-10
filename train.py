@@ -13,20 +13,20 @@ import os
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
-import glob
 import time
 from dataclasses import dataclass
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 from model import MemorizingGPT, CastedLinear
+# !pip install --upgrade triton
+# !pip install onnxruntime-gpu
 
 init_from = 'scratch' # 'scratch' or 'resume'
-dataset = 'tinyshakespeare' # openwebtext, tinyshakespeare
+dataset = 'data/tinyshakespeare/' # data/openwebtext/, data/tinyshakespeare/
 # attempt to autodetect device
 device = "cuda"
 if not torch.cuda.is_available():
@@ -35,124 +35,68 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    vocab_size : int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer : int = 48 # size of the model (48, 36, 24, 12)
-    n_head : int = 25 # size of the model (25, 20, 16, 12)
-    n_embd: int = 1600 # size of the model (1600, 1280, 1024, 768)
-    dropout: float = 0.5 # for determinism
-    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    sequence_length : int  = 6*1024 # sequence length, in tokens (for single T4 GPU)
+    vocab_size : int       = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer : int          = 12 # size of the model (48, 36, 24, 12)
+    n_head : int           = 12 # size of the model (25, 20, 16, 12)
+    n_embd: int            = 768 # size of the model (1600, 1280, 1024, 768)
+    dropout: float         = 0.5 # for determinism
     max_knn_memories: bool = 130943 # the maximum number of memories that will be stored locally
 configGpt = GPTConfig()
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = f'data/{dataset}/train*.bin' # input .bin to train on
-    input_val_bin : str = f'data/{dataset}/val*.bin' # input .bin to eval validation loss on
+    input_bin : str = f'{dataset}train*.bin' # input .bin to train on
+    input_val_bin : str = f'{dataset}val*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 2 # batch size, in sequences, across all devices
+    batch_size : int = 10 # batch size, in sequences, across all devices (for single T4 GPU)
     device_batch_size : int = 1 # batch size, in sequences, per device
-    sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 180 # number of iterations to run (180 for tinyshakespeare, 1800 for openwebtext)
-    warmup_iters : int = 1 # (1 for tinyshakespeare, 10 for openwebtext)
-    cooldown_iters : int = 64 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule (64 for tinyshakespeare, 640 for openwebtext)
+    num_iterations : int = 153 # number of iterations to run (153 for tinyshakespeare, 1530 for openwebtext 1B)
+    warmup_iters : int = 1 # (1 for tinyshakespeare, 10 for openwebtext 1B)
+    cooldown_iters : int = 64 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule (64 for tinyshakespeare, 640 for openwebtext 1B)
     # evaluation and logging hyperparams
-    val_loss_every : int = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext)
+    val_loss_every : int = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
+
+os.environ['RANK'] = '0'
+os.environ['WORLD_SIZE'] = '1' 
+os.environ['MASTER_ADDR'] = 'localhost'
+os.environ['MASTER_PORT'] = '12355'
+dist.init_process_group(backend='nccl')
 # we are running on a single gpu, and one process
 tokens_per_iter = args.batch_size * args.device_batch_size * args.sequence_length
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 # -----------------------------------------------------------------------------
-# Our own simple Distributed Data Loader
-def _peek_data_shard(filename):
-    # only reads the header, returns header data
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-    if header[0] != 20240520:
-        print("ERROR: magic number mismatch in the data .bin file!")
-        print("---> HINT: Are you passing in a correct file with --input_bin?")
-        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
-        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
-        exit(1)
-    assert header[1] == 1, "unsupported version"
-    ntok = header[2] # number of tokens (claimed)
-    return ntok # for now just return the number of tokens
+# Our own simple Data Loader
+def next_batch(split):
+    # We recreate np.memmap every batch to avoid a memory leak, as per
+    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    if split == 'train':
+        data = np.memmap(os.path.join(dataset, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(dataset, 'val.bin'), dtype=np.uint16, mode='r')
+    ix = torch.randint(len(data) - args.sequence_length, (args.device_batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+args.sequence_length]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+args.sequence_length]).astype(np.int64)) for i in ix])
+    # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+    x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    return x, y
 
-def _load_data_shard(filename):
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-        assert header[1] == 1, "unsupported version"
-        ntok = header[2] # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
-    assert len(tokens) == ntok, "number of tokens read does not match header?"
-    return tokens
-
-class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.B = B
-        self.T = T
-
-        # glob files that match the pattern
-        self.files = sorted(glob.glob(filename_pattern))
-        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
-
-        # load and validate all data shards, count number of tokens in total
-        ntok_total = 0
-        for fname in self.files:
-            shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += int(shard_ntok)
-        self.ntok_total = ntok_total
-
-        self.reset()
-
-    def reset(self):
-        self.current_shard = -1
-        self.advance()
-
-    def advance(self): # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
-
-    def next_batch(self):
-        batch_size = self.B * self.T * self.num_processes
-        buf = self.tokens[self.current_position:self.current_position+self.B*self.T+1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = buf[:-1] # inputs
-        y = buf[1:] # targets
-        # advance current position and load next shard if necessary
-        self.current_position += batch_size
-        if self.current_position + batch_size >= len(self.tokens):
-            self.advance()
-        return x.cuda(), y.cuda()
-
-# convenience variables
-T = args.sequence_length
 # calculate the number of steps to take in the val loop.
-assert args.val_tokens % T == 0
-val_steps = args.val_tokens // T
+assert args.val_tokens % args.sequence_length == 0
+val_steps = args.val_tokens // args.sequence_length
 # load tokens
-train_loader = DistributedDataLoader(args.input_bin, T, 0, 1)
-val_loader = DistributedDataLoader(args.input_val_bin, T, 0, 1)
-print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-print('='*100, logonly=True)
-x, y = train_loader.next_batch()
+print('='*100)
+x, y = next_batch('train') # fetch the very first batch
 # -----------------------------------------------------------------------------
 # Muon optimizer
 def zeropower_via_svd(G, steps=None):
     U, S, V = G.svd()
     return U @ V.T
 
-@torch.compile
+@torch.compile # (backend="onnxrt")
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -239,8 +183,8 @@ class Muon(torch.optim.Optimizer):
                 curr_idx += p.numel()
 
 # model init
-model_args = dict(n_layer=configGpt.n_layer, n_head=configGpt.n_head, n_embd=configGpt.n_embd, 
-    bias=configGpt.bias, vocab_size=configGpt.vocab_size, dropout=configGpt.dropout, max_knn_memories=configGpt.max_knn_memories)
+model_args = dict(n_layer=configGpt.n_layer, n_head=configGpt.n_head, n_embd=configGpt.n_embd,
+    vocab_size=configGpt.vocab_size, dropout=configGpt.dropout, max_knn_memories=configGpt.max_knn_memories)
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -252,7 +196,7 @@ elif init_from == 'resume':
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
-    for k in ['n_layer', 'n_head', 'n_embd', 'dropout', 'bias', 'vocab_size', 'max_knn_memories']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'dropout', 'vocab_size', 'max_knn_memories']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
@@ -269,7 +213,6 @@ model.to(device)
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
 num_vocab = 50304
-model = MemorizingGPT(GPTConfig())
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -278,7 +221,7 @@ if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True
 # compile the model
 print("compiling the model... (takes a ~minute)")
-model = torch.compile(model)
+model = torch.compile(model) # backend="onnxrt"
 
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([model.transformer.wte.weight], lr=0.6,   betas=(0.9, 0.95), fused=True)
@@ -335,16 +278,15 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # run validation batches
         model.eval()
-        val_loader.reset()
         val_loss = 0.0
         for _ in range(val_steps):
             with torch.no_grad():
-                x_val, y_val = val_loader.next_batch()
+                x_val, y_val = next_batch('val')
                 val_loss += model(x_val, y_val)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
-        print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        print(f'step: {step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -374,7 +316,7 @@ for step in range(args.num_iterations + 1):
         loss = model(x, y)
         train_loss = loss.detach()
         # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
+        x, y = next_batch('train')
         # backward pass
         if i < args.batch_size:
             with model.no_sync(): # there's no need to sync gradients every accumulation step
@@ -395,6 +337,6 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
     approx_time = training_time_ms + 1000 * (time.time() - t0)
-    print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+    print(f"step: {step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
     
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
