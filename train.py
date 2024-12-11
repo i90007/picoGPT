@@ -46,18 +46,19 @@ configGpt = GPTConfig()
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = f'{dataset}train*.bin' # input .bin to train on
-    input_val_bin : str = f'{dataset}val*.bin' # input .bin to eval validation loss on
+    input_bin : str         = f'{dataset}train*.bin' # input .bin to train on
+    input_val_bin : str     = f'{dataset}val*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 10 # batch size, in sequences, across all devices (for single T4 GPU)
+    batch_size : int        = 8 # batch size, in sequences, across all devices (for single T4 GPU)
     device_batch_size : int = 1 # batch size, in sequences, per device
-    num_iterations : int = 153 # number of iterations to run (153 for tinyshakespeare, 1530 for openwebtext 1B)
-    warmup_iters : int = 1 # (1 for tinyshakespeare, 10 for openwebtext 1B)
-    cooldown_iters : int = 64 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule (64 for tinyshakespeare, 640 for openwebtext 1B)
+    num_iterations : int    = 153 # number of iterations to run (153 for tinyshakespeare, 1530 for openwebtext 1B)
+    warmup_iters : int      = 1 # (1 for tinyshakespeare, 10 for openwebtext 1B)
+    cooldown_iters : int    = 64 # number of iterations of linear warmup for triangular or trapezoidal schedule (64 for tinyshakespeare, 640 for openwebtext 1B)
     # evaluation and logging hyperparams
-    val_loss_every : int = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
-    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    val_loss_every : int    = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
+    val_steps : int         = 9
+    val_tokens : int        = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    save_every : int        = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
 os.environ['RANK'] = '0'
@@ -84,9 +85,6 @@ def next_batch(split):
     x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     return x, y
 
-# calculate the number of steps to take in the val loop.
-assert args.val_tokens % args.sequence_length == 0
-val_steps = args.val_tokens // args.sequence_length
 # load tokens
 print('='*100)
 x, y = next_batch('train') # fetch the very first batch
@@ -279,12 +277,12 @@ for step in range(args.num_iterations + 1):
         # run validation batches
         model.eval()
         val_loss = 0.0
-        for _ in range(val_steps):
+        for _ in range(args.val_steps):
             with torch.no_grad():
                 x_val, y_val = next_batch('val')
                 val_loss += model(x_val, y_val)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        val_loss /= val_steps
+        val_loss /= args.val_steps
         # log val loss to console and to logfile
         print(f'step: {step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
         # start the clock again
