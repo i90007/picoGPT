@@ -1,13 +1,8 @@
 """
 The training script for running on a single gpu
 Little logs:
-1) block_size = 512
-dropout = 0.5
-number of parameters: 759.66M
-iter 100: loss 6.3455
-For T4 on Google Colab should be: gradient_accumulation_steps = 2 and batch_size = 1
---- after refactoring and optimization ---
-2) 
+1) tinyshakespeare
+...
 """
 import os
 import sys
@@ -17,7 +12,6 @@ import time
 from dataclasses import dataclass
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch._inductor.config as config
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
@@ -35,7 +29,7 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int  = 6*1024 # sequence length, in tokens (for single T4 GPU)
+    sequence_length : int  = 5*1024 # sequence length, in tokens (for single T4 GPU)
     vocab_size : int       = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int          = 12 # size of the model (48, 36, 24, 12)
     n_head : int           = 12 # size of the model (25, 20, 16, 12)
@@ -49,7 +43,7 @@ class Hyperparameters:
     input_bin : str         = f'{dataset}train*.bin' # input .bin to train on
     input_val_bin : str     = f'{dataset}val*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int        = 8 # batch size, in sequences, across all devices (for single T4 GPU)
+    batch_size : int        = 4 # batch size, in sequences, across all devices (for single T4 GPU)
     device_batch_size : int = 1 # batch size, in sequences, per device
     num_iterations : int    = 153 # number of iterations to run (153 for tinyshakespeare, 1530 for openwebtext 1B)
     warmup_iters : int      = 1 # (1 for tinyshakespeare, 10 for openwebtext 1B)
@@ -60,12 +54,6 @@ class Hyperparameters:
     val_tokens : int        = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int        = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
-
-os.environ['RANK'] = '0'
-os.environ['WORLD_SIZE'] = '1' 
-os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '12355'
-dist.init_process_group(backend='nccl')
 # we are running on a single gpu, and one process
 tokens_per_iter = args.batch_size * args.device_batch_size * args.sequence_length
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
@@ -155,23 +143,19 @@ class Muon(torch.optim.Optimizer):
             updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
             curr_idx = 0
             for i, p in enumerate(group['params']):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
-                    g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf = state['momentum_buffer']
-                    buf.mul_(momentum).add_(g)
-                    g = g.add(buf, alpha=momentum) if group['nesterov'] else buf
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
-                curr_idx += p.numel()
+                g = p.grad
+                assert g is not None
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                g = g.add(buf, alpha=momentum) if group['nesterov'] else buf
+                g = zeropower_backend(g, steps=group['backend_steps'])
+                g *= max(1, g.size(0)/g.size(1))**0.5
+                updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
 
-            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+                curr_idx += p.numel()
 
             # deserialize and apply updates
             curr_idx = 0
@@ -281,7 +265,6 @@ for step in range(args.num_iterations + 1):
             with torch.no_grad():
                 x_val, y_val = next_batch('val')
                 val_loss += model(x_val, y_val)
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= args.val_steps
         # log val loss to console and to logfile
         print(f'step: {step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
