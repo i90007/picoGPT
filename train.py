@@ -1,8 +1,19 @@
 """
+https://github.com/i90007/picoGPT
 The training script for running on a single gpu
 Little logs:
-1) tinyshakespeare
-...
+1) tinyshakespeare, 1 T4 GPU, Google Colab, 23 m.
+sequence_length  = 5*1024
+n_layer          = 12
+n_head           = 12
+n_embd           = 768
+dropout          = 0.5
+max_knn_memories = 130943
+batch_size       = 1
+num_iterations   = 153
+tokens per iteration will be: 5,120
+step: 153/153 train_loss: 4.4062 train_time: 940186 ms
+step: 153/153 val_loss: 5.1875 train_time: 940187 ms
 """
 import os
 import sys
@@ -45,7 +56,7 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int        = 1 # batch size, in sequences, across all devices (for single T4 GPU)
     device_batch_size : int = 1 # batch size, in sequences, per device
-    num_iterations : int    = 153 # number of iterations to run (153 for tinyshakespeare, 1530 for openwebtext 1B)
+    num_iterations : int    = 150 # number of iterations to run (153 for tinyshakespeare, 1530 for openwebtext 1B)
     warmup_iters : int      = 1 # (1 for tinyshakespeare, 10 for openwebtext 1B)
     cooldown_iters : int    = 64 # number of iterations of linear warmup for triangular or trapezoidal schedule (64 for tinyshakespeare, 640 for openwebtext 1B)
     # evaluation and logging hyperparams
@@ -267,7 +278,7 @@ for step in range(args.num_iterations + 1):
                 val_loss += model(x_val, y_val)
         val_loss /= args.val_steps
         # log val loss to console and to logfile
-        print(f'step: {step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        print(f'step: {step}/{args.num_iterations} val_loss: {val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg: {training_time_ms/(timed_steps-1):.2f}ms')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -278,7 +289,7 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
         checkpoint = dict(step=step, code=code, model=model.state_dict(), model_args=model_args, optimizers=[opt.state_dict() for opt in optimizers])
-        torch.save(checkpoint, 'out/ckpt.pt')
+        torch.save(checkpoint, 'ckpt.pt')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -318,6 +329,6 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
     approx_time = training_time_ms + 1000 * (time.time() - t0)
-    print(f"step: {step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+    print(f"step: {step+1}/{args.num_iterations} train_loss: {train_loss.item():.4f} train_time: {approx_time:.0f}ms step_avg: {approx_time/timed_steps:.2f}ms")
     
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")

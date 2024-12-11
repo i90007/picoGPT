@@ -1,24 +1,3 @@
-"""
-Full definition of the Language Model, all of it in this single file.
-"""
-import logging
-import torch
-from torch import nn
-import torch.nn.functional as F
-import numpy as np
-import time
-from einops import rearrange, einsum
-#!conda install faiss-gpu
-import faiss
-from torch.compiler import allow_in_graph
-# Use of FlexAttention
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-# from torch._subclasses.fake_tensor import FakeTensorMode
-# !pip install --upgrade triton
-# !pip install onnxruntime-gpu
-flex_attention = torch.compile(flex_attention, dynamic=False) # backend="onnxrt"
-create_block_mask = torch.compile(create_block_mask, dynamic=False) # backend="onnxrt"
-
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
@@ -82,7 +61,7 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(dim, n_head)
         # output projection
         self.c_proj = CastedLinear(dim, dim)
-        self.c_proj.weight.data.zero_() # zero init
+        nn.init.xavier_uniform_(self.c_proj.weight)
 
     def forward(self, x, vi, block_mask):
         B, _, T, _ = x.size()  # batch size, sequence length (T), embedding_dim
@@ -103,8 +82,8 @@ class CausalSelfAttention(nn.Module):
 
         if vi is None:
             vi = v.clone()  # This happens if we are in the first block
-        print(f"v.shape: {v.shape}, vi.shape: {vi.shape}")
-        assert vi.shape == v.shape, f"Expected vi.shape to match v.shape, but got vi.shape={vi.shape} and v.shape={v.shape}"
+        elif vi.shape != v.shape: # Reshape or expand vi to match v if necessary
+            vi = vi.view_as(v)  # Ensure compatible dimensions
         # Calculate value residual and apply rotary embeddings
         v = (1 - self.lamb) * v + self.lamb * vi
         q, k = norm(q), norm(k)  # QK norm
@@ -145,7 +124,7 @@ class KNN():
 
     def search_and_retrieve(self, query_vecs, topk):
         start_time = time.time()
-        _, indices = self.index.search(query_vecs, topk)
+        _, indices = self.index.search(query_vecs.squeeze(0), topk)
         kvs = self.db[indices]
 
         elapsed_time = time.time() - start_time
@@ -169,8 +148,8 @@ class KNN():
         query_batch_size, query_seq_len = query_vecs.shape[0], query_vecs.shape[1]
         device = query_vecs.device
         # Input is b n d, flatten to (b n) d
-        query_vecs = query_vecs.flatten(0,1)
-        kvs = self.search_and_retrieve(np.ascontiguousarray(query_vecs.detach().cpu().numpy()), topk)
+        query_vecs = query_vecs.to(torch.float32).detach().cpu().numpy()
+        kvs = self.search_and_retrieve(np.ascontiguousarray(query_vecs), topk)
         # kvs are (b n) k 2 d, unflatten to b n k 2 d
         kvs = torch.tensor(kvs)
         kvs = torch.unflatten(kvs, 0, (query_batch_size, query_seq_len))
@@ -185,19 +164,19 @@ class KNN():
 class KNNAttention(nn.Module):
     def __init__(self, config, knn):
         super().__init__()
+        self.sequence_length = config.sequence_length
+        self.n_head = config.n_head
         assert config.n_embd % config.n_head == 0
         self.scale = config.n_embd / config.n_head ** -0.5
         self.max_memories = config.max_knn_memories
         self.dropout = config.dropout
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.query_matrix = nn.Linear(config.n_embd, config.n_embd)
+        self.key_matrix = nn.Linear(config.n_embd, config.n_embd)
+        self.value_matrix = nn.Linear(config.n_embd, config.n_embd)
+        self.output_matrix = nn.Linear(config.n_embd, config.n_embd)
         # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
+        self.dropout = nn.Dropout(config.dropout)
 
         self.gate_bias = nn.Parameter(torch.randn(config.n_head, 1, 1))
         self.knn = knn
@@ -206,15 +185,32 @@ class KNNAttention(nn.Module):
         logger = logging.getLogger(__name__)
         logger.setLevel(logging.INFO)
 
-        B, T, n_head, C = vi.size()
-        x = x.view(B, T, C*n_head)
-        q, k_xl, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k_xl.view(B, T, self.n_head, C).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C).transpose(1, 2) # (B, nh, T, hs)
-        xl_sequence_length = k_xl.shape[1]
-        # efficient attention using Flash Attention CUDA kernels
-        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        device = x.device
+        batch_size, sequence_length = x.shape[:2]
+        x = x.squeeze(1)
+        queries = self.query_matrix(x)
+        keys = self.key_matrix(x)
+        values = self.value_matrix(x)
+
+        queries = F.normalize(queries, dim=-1)
+        keys = F.normalize(keys, dim=-1)
+
+        ### LOCAL ATTENTION
+        queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.n_head)
+        keys    = rearrange(keys, 'b t (h d) -> b h t d', h = self.n_head)
+        qk      = einsum(queries, keys, 'b h i d, b h j d -> b h i j')
+
+        i, j = qk.shape[-2:]
+        qk = qk * self.scale
+
+        mask = torch.ones((i,j), dtype = torch.bool, device=device).triu(j-i+1) ########
+        qk = qk.masked_fill(mask, float('-inf'))
+
+        qk = F.softmax(qk, dim=-1)
+        qk = self.dropout(qk)
+
+        values = rearrange(values, 'b t (h d) -> b h t d', h = self.n_head)
+        qkv = qk@values
 
         ### KNN ATTENTION
         # If there are knn memories (we're not on the first segment) then perform knn attention
@@ -225,7 +221,7 @@ class KNNAttention(nn.Module):
             logger.info("Begin KNN operations")
             t1 = time.time()
             # Convert queries to search form
-            queries = rearrange(q, 'b h t d -> b t (h d)')
+            queries = rearrange(queries, 'b h t d -> b t (h d)')
             mem_kv = self.knn.search(queries, topk = 3) # returns b t k 2 d
             mem_k, mem_v = mem_kv.unbind(dim = -2)
             mem_k = rearrange(mem_k, 'b t k (h d) -> b h t k d', h = self.n_head)
@@ -233,30 +229,28 @@ class KNNAttention(nn.Module):
 
             # Convert queries to attention form
             queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.n_head)
-            mem_qk = einsum(queries, mem_k, 'b h t d, b h t k d -> b h t k')
+            mem_qk = einsum(queries.to(torch.float32), mem_k, 'b h t d, b h t k d -> b h t k')
             mem_qk = mem_qk * self.scale
 
             mem_qk = F.softmax(mem_qk, dim = -1)
-            mem_qk = self.resid_dropout(mem_qk)
+            mem_qk = self.dropout(mem_qk)
             mem_qkv = einsum(mem_qk, mem_v, 'b h t k, b h t k d -> b h t d')
 
             # Combined attentions
-            combined_qkv = mem_qkv * self.gate_bias + y * (1 - self.gate_bias)
-            combined_qkv = rearrange(combined_qkv, 'b h t d -> b t (h d)')
-            out = self.resid_dropout(self.c_proj(combined_qkv))
+            combined_qkv = mem_qkv * self.gate_bias + qkv * (1 - self.gate_bias)
+            combined_qkv = rearrange(combined_qkv.to(torch.bfloat16), 'b h t d -> b t (h d)')
+            out = self.output_matrix(combined_qkv)
             t2 = time.time()
             logger.info(f"KNN operations completed. Time taken: {t2 - t1:.4f} seconds.")
         else:
             logger.info("No KNN memories available.")
-            y = y.transpose(1, 2).contiguous().view(B, T, C*n_head) # re-assemble all head outputs side by side
-            out = self.c_proj(y)
-            out = self.resid_dropout(out)
-
-        # new XL memories
-        k = rearrange(k, 'b h t d -> b t (h d)', h = self.n_head)
-        v = rearrange(v, 'b h t d -> b t (h d)', h = self.n_head)
-        kv_memories = torch.stack((k, v), dim=-2) # (batch, sequence_len, 2, dimension)
-        _, kv_memories = kv_memories[:, :-xl_sequence_length], kv_memories[:, -xl_sequence_length:]
+            qkv = rearrange(qkv, 'b h t d -> b t (h d)')
+            out = self.output_matrix(qkv)
+        # new memories
+        keys = rearrange(keys, 'b h t d -> b t (h d)', h = self.n_head)
+        values = rearrange(values, 'b h t d -> b t (h d)', h = self.n_head)
+        kv_memories = torch.stack((keys, values), dim=-2) # (batch, sequence_len, 2, dimension)
+        _, kv_memories = kv_memories[:, :-sequence_length], kv_memories[:, -sequence_length:]
         self.knn.add(kv_memories)
 
         return out
@@ -285,10 +279,9 @@ class Block(nn.Module):
 
     def forward(self, x, vi, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, vi = self.attn(norm(x), vi, block_mask)
-        x = x + x1
+        x = self.attn(norm(x), vi, block_mask)
         x = x + self.mlp(norm(x))
-        return x, vi
+        return x
 
 
 class MemorizingGPT(nn.Module):
@@ -302,9 +295,9 @@ class MemorizingGPT(nn.Module):
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
-        self.knn = KNN(config.n_embd, config.max_knn_memories)
+        knn = KNN(config.n_embd, config.max_knn_memories)
         self.drop = nn.Dropout(config.dropout)
-        self.knn_attention = KNNAttention(config, self.knn)
+        self.knn_attention = KNNAttention(config, knn)
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -370,11 +363,12 @@ class MemorizingGPT(nn.Module):
             # if we are given some desired target also calculate the loss
             logits = self.lm_head(x)
             logits = 30 * torch.tanh(logits / 30)
-            logits = logits.float()
             target = target.view(-1)
             if logits.size(0) > target.size(0):
               logits = logits[-target.size(0):]
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target, ignore_index=-1)
+            logits = logits.view(-1, logits.size(-1))
+            target = target.view(-1)
+            loss = F.cross_entropy(logits, target, ignore_index=-1)
         else:
             loss = None
 
