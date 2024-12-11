@@ -43,7 +43,7 @@ class Hyperparameters:
     input_bin : str         = f'{dataset}train*.bin' # input .bin to train on
     input_val_bin : str     = f'{dataset}val*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int        = 4 # batch size, in sequences, across all devices (for single T4 GPU)
+    batch_size : int        = 1 # batch size, in sequences, across all devices (for single T4 GPU)
     device_batch_size : int = 1 # batch size, in sequences, per device
     num_iterations : int    = 153 # number of iterations to run (153 for tinyshakespeare, 1530 for openwebtext 1B)
     warmup_iters : int      = 1 # (1 for tinyshakespeare, 10 for openwebtext 1B)
