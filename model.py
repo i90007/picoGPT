@@ -1,3 +1,20 @@
+import logging
+import torch
+from torch import nn
+import torch.nn.functional as F
+import numpy as np
+import time
+from einops import rearrange, einsum
+#!conda install faiss-gpu
+import faiss
+from torch.compiler import allow_in_graph
+# Use of FlexAttention
+from torch.nn.attention.flex_attention import flex_attention, BlockMask
+# from torch._subclasses.fake_tensor import FakeTensorMode
+# !pip install --upgrade triton
+# !pip install onnxruntime-gpu
+flex_attention = torch.compile(flex_attention, dynamic=False) # backend="onnxrt"
+
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
@@ -287,6 +304,10 @@ class Block(nn.Module):
 class MemorizingGPT(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.vocab_size = config.vocab_size
+        self.head_dim = config.n_embd / config.n_head
+        self.sliding_window_size = torch.tensor(self.head_dim, dtype=torch.int32, device="cuda")
+        self.BLOCK_SIZE = self.head_dim * 2
         self.n_layer = config.n_layer
         # U-net design
         self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
@@ -322,18 +343,31 @@ class MemorizingGPT(nn.Module):
         return n_params
 
     def forward(self, idx, target=None):
-        docs = (idx == 50304).cumsum(0)
+        docs = (idx == self.vocab_size).cumsum(0)
         docs = docs.squeeze(0)
-        def document_causal_mask(_, __, q_idx, kv_idx):
-          causal_mask = q_idx >= kv_idx
-          document_mask = docs[q_idx] == docs[kv_idx]
-          window_mask = q_idx - kv_idx < 1024
-          return causal_mask & document_mask & window_mask
+        docs_low = docs.reshape(-1, self.BLOCK_SIZE)[:, 0].contiguous()
+        docs_high = docs.reshape(-1, self.BLOCK_SIZE)[:, -1].contiguous()
 
-        S = len(idx)
-        # with FakeTensorMode(allow_non_fake_inputs=True):
-        # `_compile=True` removed because T4 GPU cann't work with it
-        block_mask = create_block_mask(document_causal_mask, None, None, S, S, device=idx.device)
+        def document_sliding_window_causal(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
+            window_mask = q_idx - kv_idx < self.sliding_window_size
+            return causal_mask & document_mask & window_mask
+
+        def create_sliding_window_causal_mask(seq_len, sliding_window_size):
+            kv_idx = block_idx = torch.arange(seq_len // self.BLOCK_SIZE, dtype=torch.int32, device="cuda")
+            q_idx = block_idx[:, None]
+            causal_mask = q_idx >= kv_idx
+            document_mask = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
+            window_mask = q_idx - kv_idx < ((sliding_window_size + self.BLOCK_SIZE - 1) // self.BLOCK_SIZE)
+            dense_mask = causal_mask & document_mask & window_mask
+            dense_mask = dense_mask.to(torch.int32)
+            num_blocks = dense_mask.sum(dim=-1).to(torch.int32)
+            indices = torch.argsort(dense_mask, dim=-1, descending=True, stable=True).to(torch.int32)
+            num_blocks = num_blocks[None, None, :].contiguous()
+            indices = indices[None, None, :].contiguous()
+            return BlockMask.from_kv_blocks(num_blocks, indices, BLOCK_SIZE=self.BLOCK_SIZE, mask_mod=document_sliding_window_causal)
+        block_mask = create_sliding_window_causal_mask(len(idx), self.sliding_window_size)
 
         # forward the GPT model itself
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
