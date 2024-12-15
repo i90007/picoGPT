@@ -10,10 +10,6 @@ import faiss
 from torch.compiler import allow_in_graph
 # Use of FlexAttention
 from torch.nn.attention.flex_attention import flex_attention, BlockMask
-# from torch._subclasses.fake_tensor import FakeTensorMode
-# !pip install --upgrade triton
-# !pip install onnxruntime-gpu
-flex_attention = torch.compile(flex_attention, dynamic=False) # backend="onnxrt"
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -107,7 +103,7 @@ class CausalSelfAttention(nn.Module):
         q, k = self.rotary(q), self.rotary(k)
 
         # Apply attention mechanism
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, enable_gqa=True)
         y = y.transpose(1, 2).contiguous().view_as(x)  # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -301,13 +297,28 @@ class Block(nn.Module):
         return x
 
 
+class ValueEmbedding(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.__setattr__
+        self.embed = nn.ModuleList([
+            nn.Embedding(config.vocab_size, config.n_embd)
+            for _ in range(6)
+        ])
+    def forward(self, inputs) -> "list[torch.Tensor]":
+        ve = [emb(inputs) for emb in self.embed]
+        ve += reversed(ve)
+        return ve
+
+
 class MemorizingGPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.vocab_size = config.vocab_size
-        self.head_dim = config.n_embd / config.n_head
+        self.head_dim = config.n_embd // config.n_head
         self.sliding_window_size = torch.tensor(self.head_dim, dtype=torch.int32, device="cuda")
-        self.BLOCK_SIZE = self.head_dim * 2
+        assert config.sequence_length % self.head_dim == 0, "Wrong sequence_length or head_dim"
+        self.mask_size = config.sequence_length // self.head_dim
         self.n_layer = config.n_layer
         # U-net design
         self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
@@ -320,13 +331,11 @@ class MemorizingGPT(nn.Module):
         self.drop = nn.Dropout(config.dropout)
         self.knn_attention = KNNAttention(config, knn)
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            # token value embeddings - inspired value residual learning
-            vte = nn.Embedding(config.vocab_size, config.n_embd * config.n_layer),
-            # "- 1" for KNNAttention
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer - 1)])
-        ))
+        self.embed = nn.Embedding(config.vocab_size, config.n_embd)
+        # "- 1" for KNNAttention
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer - 1)])
+        self.value_embeds = ValueEmbedding(config)
+
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
         self.lm_head.weight.data.zero_()
 
@@ -342,55 +351,71 @@ class MemorizingGPT(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
 
-    def forward(self, idx, target=None):
-        docs = (idx == self.vocab_size).cumsum(0)
-        docs = docs.squeeze(0)
-        docs_low = docs.reshape(-1, self.BLOCK_SIZE)[:, 0].contiguous()
-        docs_high = docs.reshape(-1, self.BLOCK_SIZE)[:, -1].contiguous()
-
-        def document_sliding_window_causal(b, h, q_idx, kv_idx):
+    def forward(
+            self,
+            sliding_window_num_blocks: torch.Tensor,
+            idx: torch.Tensor,
+            target: torch.Tensor = None
+        ):
+        docs = (idx == 50304).cumsum(0)
+        docs_low = docs.view(-1, self.head_dim)[:, 0].contiguous()
+        docs_high = docs.view(-1, self.head_dim)[:, -1].contiguous()
+        def document_causal(_, __, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
-            document_mask = docs[q_idx] == docs[kv_idx]
-            window_mask = q_idx - kv_idx < self.sliding_window_size
-            return causal_mask & document_mask & window_mask
+            document_mask = docs[0].gather(0, q_idx.to(torch.int64)) == docs[0].gather(0, kv_idx.to(torch.int64))
+            return causal_mask & document_mask
 
-        def create_sliding_window_causal_mask(seq_len, sliding_window_size):
-            kv_idx = block_idx = torch.arange(seq_len // self.BLOCK_SIZE, dtype=torch.int32, device="cuda")
+        def dense_to_ordered(dense_mask: torch.Tensor):
+            num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
+            indices = dense_mask.to(torch.int32).argsort(dim=-1, descending=True, stable=True)
+            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+
+        def create_doc_swc_block_mask(sliding_window_num_blocks: torch.Tensor):
+            kv_idx = block_idx = torch.arange(self.mask_size, dtype=torch.int32, device="cuda")
             q_idx = block_idx[:, None]
-            causal_mask = q_idx >= kv_idx
-            document_mask = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
-            window_mask = q_idx - kv_idx < ((sliding_window_size + self.BLOCK_SIZE - 1) // self.BLOCK_SIZE)
-            dense_mask = causal_mask & document_mask & window_mask
-            dense_mask = dense_mask.to(torch.int32)
-            num_blocks = dense_mask.sum(dim=-1).to(torch.int32)
-            indices = torch.argsort(dense_mask, dim=-1, descending=True, stable=True).to(torch.int32)
-            num_blocks = num_blocks[None, None, :].contiguous()
-            indices = indices[None, None, :].contiguous()
-            return BlockMask.from_kv_blocks(num_blocks, indices, BLOCK_SIZE=self.BLOCK_SIZE, mask_mod=document_sliding_window_causal)
-        block_mask = create_sliding_window_causal_mask(len(idx), self.sliding_window_size)
+            causal_bm = q_idx >= kv_idx
+            causal_full_bm = q_idx > kv_idx
+            window_bm = q_idx - kv_idx < sliding_window_num_blocks
+            window_full_bm = window_bm
+            document_bm = (docs_low[:, None] <= docs_high) & (docs_low <= docs_high[:, None])
+            document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
+            nonzero_bm = causal_bm & window_bm & document_bm
+            full_bm  = causal_full_bm & window_full_bm & document_full_bm
+            kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm ^ full_bm)
+            full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
+            return BlockMask.from_kv_blocks(
+                kv_num_blocks,
+                kv_indices,
+                full_kv_num_blocks,
+                full_kv_indices,
+                BLOCK_SIZE=self.head_dim,
+                mask_mod=document_causal
+            )
+        block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
 
         # forward the GPT model itself
-        x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
+        x = self.embed(idx[None]) # token embeddings of shape (b, t, n_embd)
         x = norm(x)
         x = self.drop(x)
         x0 = x
-        vi = self.transformer.vte(idx[None]).chunk(self.n_layer, dim=-1)
+        ve = self.value_embeds(idx)
+        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
 
         # Store outputs for U-Net skip connections
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
-            x = self.transformer.h[i](x, vi[i], x0, block_mask)
+            x = self.blocks[i](x, ve_enc[i], x0, block_mask)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             if i == self.num_decoder_layers - 2:
                 x = x + self.skip_weights[i] * skip_connections.pop()
                 x = self.knn_attention(x)
-                x = self.transformer.h[self.num_encoder_layers + i](x, vi[self.num_encoder_layers+i], x0, block_mask)
+                x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
             else:
                 x = x + self.skip_weights[i] * skip_connections.pop()
-                x = self.transformer.h[self.num_encoder_layers + i](x, vi[self.num_encoder_layers+i], x0, block_mask)
+                x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
 
         x = norm(x)
         if target is not None:

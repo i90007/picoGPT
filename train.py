@@ -20,6 +20,7 @@ import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import time
+import contextlib
 from dataclasses import dataclass
 import numpy as np
 import torch
@@ -43,9 +44,9 @@ class GPTConfig:
     sequence_length : int  = 5*1024 # sequence length, in tokens (for single T4 GPU)
     vocab_size : int       = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int          = 12 # size of the model (48, 36, 24, 12)
-    n_head : int           = 12 # size of the model (25, 20, 16, 12)
+    n_head : int           = 6 # size of the model (24, 18, 12, 6)
     n_embd: int            = 768 # size of the model (1600, 1280, 1024, 768)
-    dropout: float         = 0.5 # for determinism
+    dropout: float         = 0.4 # for determinism
     max_knn_memories: bool = 130943 # the maximum number of memories that will be stored locally
 configGpt = GPTConfig()
 @dataclass
@@ -56,13 +57,12 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int        = 1 # batch size, in sequences, across all devices (for single T4 GPU)
     device_batch_size : int = 1 # batch size, in sequences, per device
-    num_iterations : int    = 150 # number of iterations to run (153 for tinyshakespeare, 1530 for openwebtext 1B)
+    num_iterations : int    = 148 # number of iterations to run (148 for tinyshakespeare, 1480 for openwebtext 1B)
     warmup_iters : int      = 1 # (1 for tinyshakespeare, 10 for openwebtext 1B)
     cooldown_iters : int    = 64 # number of iterations of linear warmup for triangular or trapezoidal schedule (64 for tinyshakespeare, 640 for openwebtext 1B)
     # evaluation and logging hyperparams
     val_loss_every : int    = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
     val_steps : int         = 9
-    val_tokens : int        = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int        = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 # we are running on a single gpu, and one process
@@ -214,16 +214,17 @@ if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True
 # compile the model
 print("compiling the model... (takes a ~minute)")
-model = torch.compile(model) # backend="onnxrt"
+model = torch.compile(model)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([model.transformer.wte.weight], lr=0.6,   betas=(0.9, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([model.lm_head.weight],         lr=0.008, betas=(0.9, 0.95), fused=True)
-params = list(model.transformer.h.parameters())
+embed_params = [*model.embed.parameters(), *model.value_embeds.parameters()]
+optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
+params = list(model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.04, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
@@ -248,6 +249,8 @@ checkpoint = None # free up memory
 
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
+sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device="cuda")
+sw_num_blocks_prev = 1
 # Start training loop
 training_time_ms = 0
 # start the clock
@@ -264,6 +267,13 @@ for step in range(args.num_iterations + 1):
         t0 = time.time()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
+    # Linearly increase the sliding window size over training in chunks of 64 from 64 -> 1792. By @fernbear.bsky.social
+    frac_done = step / args.num_iterations # training progress
+    sw_num_blocks = int(((1 - frac_done) * 64 + frac_done * 1792 + 64) // 128)
+    if sw_num_blocks != sw_num_blocks_prev:
+        sliding_window_num_blocks.copy_(sw_num_blocks, non_blocking=True)
+        sw_num_blocks_prev = sw_num_blocks
+
     # once in a while evaluate the validation dataset and write checkpoints
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         # stop the clock
@@ -275,7 +285,7 @@ for step in range(args.num_iterations + 1):
         for _ in range(args.val_steps):
             with torch.no_grad():
                 x_val, y_val = next_batch('val')
-                val_loss += model(x_val, y_val)
+                val_loss += model(sliding_window_num_blocks, x_val, y_val)
         val_loss /= args.val_steps
         # log val loss to console and to logfile
         print(f'step: {step}/{args.num_iterations} val_loss: {val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg: {training_time_ms/(timed_steps-1):.2f}ms')
@@ -303,23 +313,22 @@ for step in range(args.num_iterations + 1):
 
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
-    for i in range(1, args.batch_size+1):
-        # forward pass
-        loss = model(x, y)
-        train_loss = loss.detach()
-        # advance the dataset for the next batch
-        x, y = next_batch('train')
-        # backward pass
-        if i < args.batch_size:
-            with model.no_sync(): # there's no need to sync gradients every accumulation step
-                loss.backward()
-        else:
-            loss.backward() # just sync on the last step
-    for p in model.parameters():
-        p.grad /= args.batch_size
+    for i in range(1, args.batch_size + 1):
+        with contextlib.ExitStack() as stack:
+            if i < args.batch_size: # there's no need to sync gradients every accumulation step
+                stack.enter_context(model.no_sync())
+            if step >= 5:
+                stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
+            inputs_train, targets_train = next_batch('train')
+            model(sliding_window_num_blocks, inputs_train, targets_train).backward()
+    if args.batch_size != 1:
+        for p in model.parameters():
+            p.grad /= args.batch_size
     # momentum warmup for Muon
-    frac = min(step/500, 1)
-    optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    frac = min(step/300, 1)
+    for group in optimizer3.param_groups:
+        group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
@@ -329,6 +338,6 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
     approx_time = training_time_ms + 1000 * (time.time() - t0)
-    print(f"step: {step+1}/{args.num_iterations} train_loss: {train_loss.item():.4f} train_time: {approx_time:.0f}ms step_avg: {approx_time/timed_steps:.2f}ms")
+    print(f"step: {step+1}/{args.num_iterations} train_time: {approx_time:.0f}ms step_avg: {approx_time/timed_steps:.2f}ms")
     
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
