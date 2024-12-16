@@ -28,8 +28,11 @@ import torch._inductor.config as config
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 from model import MemorizingGPT, CastedLinear
-# !pip install --upgrade triton
-# !pip install onnxruntime-gpu
+
+# if not hasattr(torch.compiler, "set_stance"):
+  # !pip uninstall torch
+  # !pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124
+print(torch.__version__)
 
 init_from = 'scratch' # 'scratch' or 'resume'
 dataset = 'data/tinyshakespeare/' # data/openwebtext/, data/tinyshakespeare/
@@ -41,7 +44,7 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int  = 5*1024 # sequence length, in tokens (for single T4 GPU)
+    sequence_length : int  = 6*1024 # sequence length, in tokens (for single T4 GPU)
     vocab_size : int       = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int          = 12 # size of the model (48, 36, 24, 12)
     n_head : int           = 6 # size of the model (24, 18, 12, 6)
@@ -55,10 +58,10 @@ class Hyperparameters:
     input_bin : str         = f'{dataset}train*.bin' # input .bin to train on
     input_val_bin : str     = f'{dataset}val*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int        = 1 # batch size, in sequences, across all devices (for single T4 GPU)
+    batch_size : int        = 2 # batch size, in sequences, across all devices (for single T4 GPU)
     device_batch_size : int = 1 # batch size, in sequences, per device
     num_iterations : int    = 148 # number of iterations to run (148 for tinyshakespeare, 1480 for openwebtext 1B)
-    warmup_iters : int      = 1 # (1 for tinyshakespeare, 10 for openwebtext 1B)
+    warmup_iters : int      = 10
     cooldown_iters : int    = 64 # number of iterations of linear warmup for triangular or trapezoidal schedule (64 for tinyshakespeare, 640 for openwebtext 1B)
     # evaluation and logging hyperparams
     val_loss_every : int    = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
@@ -315,9 +318,7 @@ for step in range(args.num_iterations + 1):
     model.train()
     for i in range(1, args.batch_size + 1):
         with contextlib.ExitStack() as stack:
-            if i < args.batch_size: # there's no need to sync gradients every accumulation step
-                stack.enter_context(model.no_sync())
-            if step >= 5:
+            if step >= args.warmup_iters:
                 stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
             inputs_train, targets_train = next_batch('train')
             model(sliding_window_num_blocks, inputs_train, targets_train).backward()
