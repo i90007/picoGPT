@@ -231,7 +231,6 @@ class KNNAttention(nn.Module):
             logger.info("Clearing KNN memories due to limit reached.")
             self.knn.clear()
         if self.knn.index.ntotal > 0:
-            logger.info("Begin KNN operations")
             t1 = time.time()
             # Convert queries to search form
             queries = rearrange(queries, 'b h t d -> b t (h d)')
@@ -303,7 +302,7 @@ class ValueEmbedding(nn.Module):
         self.__setattr__
         self.embed = nn.ModuleList([
             nn.Embedding(config.vocab_size, config.n_embd)
-            for _ in range(6)
+            for _ in range(config.n_head)
         ])
     def forward(self, inputs) -> "list[torch.Tensor]":
         ve = [emb(inputs) for emb in self.embed]
@@ -317,13 +316,10 @@ class MemorizingGPT(nn.Module):
         self.vocab_size = config.vocab_size
         self.head_dim = config.n_embd // config.n_head
         self.sliding_window_size = torch.tensor(self.head_dim, dtype=torch.int32, device="cuda")
-        assert config.sequence_length % self.head_dim == 0, "Wrong sequence_length or head_dim"
-        self.mask_size = config.sequence_length // self.head_dim
         self.n_layer = config.n_layer
         # U-net design
         self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
-        # "- 1" for KNNAttention
-        self.num_decoder_layers = config.n_layer - self.num_encoder_layers - 1 # Remaining for decoder
+        self.num_decoder_layers = config.n_layer - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
@@ -332,8 +328,7 @@ class MemorizingGPT(nn.Module):
         self.knn_attention = KNNAttention(config, knn)
 
         self.embed = nn.Embedding(config.vocab_size, config.n_embd)
-        # "- 1" for KNNAttention
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer - 1)])
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.value_embeds = ValueEmbedding(config)
 
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
@@ -357,12 +352,19 @@ class MemorizingGPT(nn.Module):
             idx: torch.Tensor,
             target: torch.Tensor = None
         ):
-        docs = (idx == 50304).cumsum(0)
+        idx = torch.squeeze(idx)
+        seq_len = len(idx)
+        assert seq_len % self.head_dim == 0, (
+            f"seq_len = {seq_len}, self.head_dim = {self.head_dim}"
+        )
+        total_num_blocks = seq_len // self.head_dim
+        docs = (idx == 50256).cumsum(0)
+        assert idx.ndim == 1
         docs_low = docs.view(-1, self.head_dim)[:, 0].contiguous()
         docs_high = docs.view(-1, self.head_dim)[:, -1].contiguous()
         def document_causal(_, __, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
-            document_mask = docs[0].gather(0, q_idx.to(torch.int64)) == docs[0].gather(0, kv_idx.to(torch.int64))
+            document_mask = docs[q_idx] == docs[kv_idx]
             return causal_mask & document_mask
 
         def dense_to_ordered(dense_mask: torch.Tensor):
@@ -371,7 +373,7 @@ class MemorizingGPT(nn.Module):
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
         def create_doc_swc_block_mask(sliding_window_num_blocks: torch.Tensor):
-            kv_idx = block_idx = torch.arange(self.mask_size, dtype=torch.int32, device="cuda")
+            kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device="cuda")
             q_idx = block_idx[:, None]
             causal_bm = q_idx >= kv_idx
             causal_full_bm = q_idx > kv_idx
