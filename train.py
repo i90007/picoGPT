@@ -14,6 +14,19 @@ num_iterations   = 153
 tokens per iteration will be: 5,120
 step: 153/153 train_loss: 4.4062 train_time: 940186 ms
 step: 153/153 val_loss: 5.1875 train_time: 940187 ms
+2) After update, tinyshakespeare, 1 T4 GPU, Google Colab, 1h. 23m.
+number of parameters: 628.17M
+sequence_length  = 4*1024
+n_layer          = 12
+n_head           = 12
+n_embd           = 768
+dropout          = 0.4
+max_knn_memories = 130943
+batch_size       = 2
+num_iterations   = 148
+warmup_iters     = 15
+tokens per iteration will be: 8,192
+step: 148/148 val_loss: 5.062 train_time:3285885ms step_avg: 23810.76ms
 """
 import os
 import sys
@@ -44,11 +57,11 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int  = 5*1024 # sequence length, in tokens (for single T4 GPU)
+    sequence_length : int  = 4*1024 # (1*1024, 2*..., 3..., 4..) sequence length, in tokens (for single T4 GPU)
     vocab_size : int       = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer : int          = 16 # size of the model (48, 32, 24, 16)
-    n_head : int           = 8 # size of the model (24, 16, 12, 8)
-    n_embd: int            = 1024 # size of the model (1792, 1536, 1280, 1024)
+    n_layer : int          = 12 # size of the model (48, 32, 24, 12)
+    n_head : int           = 12 # size of the model (24, 20, 16, 12)
+    n_embd: int            = 768 # size of the model (1536, 1280, 1024, 768)
     dropout: float         = 0.4 # for determinism
     max_knn_memories: bool = 130943 # the maximum number of memories that will be stored locally
 configGpt = GPTConfig()
@@ -58,10 +71,10 @@ class Hyperparameters:
     input_bin : str         = f'{dataset}train*.bin' # input .bin to train on
     input_val_bin : str     = f'{dataset}val*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int        = 1 # batch size, in sequences, across all devices (for single T4 GPU)
+    batch_size : int        = 3 # batch size, in sequences, across all devices (for single T4 GPU)
     device_batch_size : int = 1 # batch size, in sequences, per device
     num_iterations : int    = 148 # number of iterations to run (148 for tinyshakespeare, 1480 for openwebtext 1B)
-    warmup_iters : int      = 15 # 10 is not enough
+    warmup_iters : int      = 11 # 10 is not enough
     cooldown_iters : int    = 64 # number of iterations of linear warmup for triangular or trapezoidal schedule (64 for tinyshakespeare, 640 for openwebtext 1B)
     # evaluation and logging hyperparams
     val_loss_every : int    = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
@@ -302,7 +315,7 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
         checkpoint = dict(step=step, code=code, model=model.state_dict(), model_args=model_args, optimizers=[opt.state_dict() for opt in optimizers])
-        torch.save(checkpoint, 'ckpt.pt')
+        # torch.save(checkpoint, 'ckpt.pt')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
