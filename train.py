@@ -47,8 +47,12 @@ from model import MemorizingGPT, CastedLinear
   # !pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124
 print(torch.__version__)
 
-init_from = 'scratch' # 'scratch' or 'resume'
-dataset = 'data/tinyshakespeare/' # data/openwebtext/, data/tinyshakespeare/
+init_from = 'scratch' # 'scratch', 'resume', 'resume_google_drive'
+def mount_drive_and_get_path():
+    from google.colab import drive
+    drive.mount('/content/drive', force_remount=True)
+    return '/content/drive/My Drive/'
+dataset = mount_drive_and_get_path() # 'data/openwebtext/', 'data/tinyshakespeare/', mount_drive_and_get_path()
 # attempt to autodetect device
 device = "cuda"
 if not torch.cuda.is_available():
@@ -71,11 +75,11 @@ class Hyperparameters:
     input_bin : str         = f'{dataset}train*.bin' # input .bin to train on
     input_val_bin : str     = f'{dataset}val*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int        = 3 # batch size, in sequences, across all devices (for single T4 GPU)
-    device_batch_size : int = 1 # batch size, in sequences, per device
+    batch_size : int        = 8 # batch size, in sequences, across all devices (for single T4 GPU)
+    device_batch_size : int = 2 # batch size, in sequences, per device
     num_iterations : int    = 148 # number of iterations to run (148 for tinyshakespeare, 1480 for openwebtext 1B)
-    warmup_iters : int      = 11 # 10 is not enough
-    cooldown_iters : int    = 64 # number of iterations of linear warmup for triangular or trapezoidal schedule (64 for tinyshakespeare, 640 for openwebtext 1B)
+    warmup_iters : int      = 6
+    cooldown_iters : int    = 60 # number of iterations of linear warmup for triangular or trapezoidal schedule (60 for tinyshakespeare, 600 for openwebtext 1B)
     # evaluation and logging hyperparams
     val_loss_every : int    = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
     val_steps : int         = 9
@@ -194,30 +198,38 @@ class Muon(torch.optim.Optimizer):
 # model init
 model_args = dict(n_layer=configGpt.n_layer, n_head=configGpt.n_head, n_embd=configGpt.n_embd,
     vocab_size=configGpt.vocab_size, dropout=configGpt.dropout, max_knn_memories=configGpt.max_knn_memories)
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
     model = MemorizingGPT(GPTConfig())
-elif init_from == 'resume':
-    print(f"Resuming training from 'out' directory")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join('out', 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    for k in ['n_layer', 'n_head', 'n_embd', 'dropout', 'vocab_size', 'max_knn_memories']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = MemorizingGPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+else:  
+  if init_from == 'resume':
+      print(f"Resuming training from local directory")
+      path = 'ckpt.pt'      
+  elif init_from == 'resume_google_drive':
+      print(f"Resuming training from google_drive")    
+      from google.colab import drive
+      drive.mount('/content/drive', force_remount=True)
+      path = '/content/drive/My Drive/ckpt.pt'
+
+  checkpoint = torch.load(path, map_location=device)
+  checkpoint_model_args = checkpoint['model_args']
+  # force these config attributes to be equal otherwise we can't even resume training
+  for k in ['n_layer', 'n_head', 'n_embd', 'dropout', 'vocab_size', 'max_knn_memories']:
+      model_args[k] = checkpoint_model_args[k]
+  # create the model
+  gptconf = GPTConfig(**model_args)
+  model = MemorizingGPT(gptconf)
+  state_dict = checkpoint['model']
+  # fix the keys of the state dictionary :(
+  # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+  unwanted_prefix = '_orig_mod.'
+  for k,v in list(state_dict.items()):
+      if k.startswith(unwanted_prefix):
+          state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+  model.load_state_dict(state_dict)
+
 model.to(device)
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
@@ -315,17 +327,22 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
         checkpoint = dict(step=step, code=code, model=model.state_dict(), model_args=model_args, optimizers=[opt.state_dict() for opt in optimizers])      
-        def get_option():
-            return os.environ.get('COLAB_GPU', '')
-        if 'google.colab' in str(get_option()):
+        def is_colab():
+          try:
+              from google.colab import drive
+              return True
+          except ImportError:
+              return False
+        if is_colab():
             try:
-                from google.colab import drive
-                drive.mount('/content/drive')
+                drive.mount('/content/drive', force_remount=True)
                 torch.save(checkpoint, '/content/drive/My Drive/ckpt.pt')
-            except ImportError:
-                torch.save(checkpoint, 'ckpt.pt')
+                print(f'Checkpoint saved to /content/drive/My Drive/ckpt.pt')
+            except Exception as e:
+                print(f'Error saving to Google Drive: {e}')
         else:
             torch.save(checkpoint, 'ckpt.pt')
+            print(f'Checkpoint saved locally to ckpt.pt')
 		# start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
