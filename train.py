@@ -314,9 +314,19 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
-        checkpoint = dict(step=step, code=code, model=model.state_dict(), model_args=model_args, optimizers=[opt.state_dict() for opt in optimizers])
-        # torch.save(checkpoint, 'ckpt.pt')
-        # start the clock again
+        checkpoint = dict(step=step, code=code, model=model.state_dict(), model_args=model_args, optimizers=[opt.state_dict() for opt in optimizers])      
+        def get_option():
+            return os.environ.get('COLAB_GPU', '')
+        if 'google.colab' in str(get_option()):
+            try:
+                from google.colab import drive
+                drive.mount('/content/drive')
+                torch.save(checkpoint, '/content/drive/My Drive/ckpt.pt')
+            except ImportError:
+                torch.save(checkpoint, 'ckpt.pt')
+        else:
+            torch.save(checkpoint, 'ckpt.pt')
+		# start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
 
