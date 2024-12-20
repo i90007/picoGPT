@@ -97,11 +97,13 @@ def next_batch(split):
         data = np.memmap(os.path.join(dataset, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(dataset, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - args.sequence_length, (args.device_batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+args.sequence_length]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+args.sequence_length]).astype(np.int64)) for i in ix])
+    ix       = torch.randint(len(data) - configGpt.sequence_length, (args.device_batch_size,))
+    sequences= [torch.from_numpy(data[i:i+configGpt.sequence_length].astype(np.int64)) for i in ix]
+    targets  = [torch.from_numpy(data[i+1:i+1+configGpt.sequence_length].astype(np.int64)) for i in ix]
+    x        = torch.cat(sequences, dim=0)
+    y        = torch.cat(targets, dim=0)
     # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-    x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    x, y     = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     return x, y
 
 # load tokens
