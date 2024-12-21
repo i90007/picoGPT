@@ -2,31 +2,29 @@
 https://github.com/i90007/picoGPT
 The training script for running on a single gpu
 Little logs:
-1) tinyshakespeare, 1 T4 GPU, Google Colab, 23 m.
-sequence_length  = 5*1024
-n_layer          = 12
-n_head           = 12
-n_embd           = 768
-dropout          = 0.5
-max_knn_memories = 130943
-batch_size       = 1
-num_iterations   = 153
-tokens per iteration will be: 5,120
-step: 153/153 train_loss: 4.4062 train_time: 940186 ms
-step: 153/153 val_loss: 5.1875 train_time: 940187 ms
-2) After update, tinyshakespeare, 1 T4 GPU, Google Colab, 1h. 23m.
+1) After update, tinyshakespeare, 1 T4 GPU, Google Colab, 1h. 23m.
 number of parameters: 628.17M
-sequence_length  = 4*1024
-n_layer          = 12
-n_head           = 12
-n_embd           = 768
-dropout          = 0.4
-max_knn_memories = 130943
-batch_size       = 2
-num_iterations   = 148
-warmup_iters     = 15
+sequence_length = 4*1024
+n_layer         = 12
+n_head          = 12
+n_embd          = 768
+dropout         = 0.4
+max_knn_memories= 130943
+batch_size      = 2
+num_iterations  = 148
+warmup_iters    = 15
 tokens per iteration will be: 8,192
 step: 148/148 val_loss: 5.062 train_time:3285885ms step_avg: 23810.76ms
+2) openwebtext, 1 T4 GPU, Google Colab, .
+number of parameters: 628.17M
+sequence_length = 4*1024
+n_layer         = 12
+n_head          = 12
+n_embd          = 768
+dropout         = 0.4
+max_knn_memories= 99999
+batch_size      = 16
+num_iterations  = 100
 """
 import os
 import sys
@@ -41,15 +39,20 @@ import torch._inductor.config as config
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 from model import MemorizingGPT, CastedLinear
-
+def is_colab():
+  try:
+      from google.colab import drive
+      return True
+  except ImportError:
+      return False
+is_colab = is_colab()
 # if not hasattr(torch.compiler, "set_stance"):
-  # !pip uninstall torch
-  # !pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124
+#   !pip uninstall torch
+#   !pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124
 print(torch.__version__)
 
 init_from = 'scratch' # 'scratch', 'resume', 'resume_google_drive'
 def mount_drive_and_get_path():
-    from google.colab import drive
     drive.mount('/content/drive', force_remount=True)
     return '/content/drive/My Drive/'
 dataset = mount_drive_and_get_path() # 'data/openwebtext/', 'data/tinyshakespeare/', mount_drive_and_get_path()
@@ -61,13 +64,14 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int  = 4*1024 # (1*1024, 2*..., 3..., 4..) sequence length, in tokens (for single T4 GPU)
+    sequence_length : int  = 4608 # (1024, 2048, 3072, 4608) sequence length, in tokens (shold be as big as possible)
     vocab_size : int       = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int          = 12 # size of the model (48, 32, 24, 12)
     n_head : int           = 12 # size of the model (24, 20, 16, 12)
     n_embd: int            = 768 # size of the model (1536, 1280, 1024, 768)
     dropout: float         = 0.4 # for determinism
-    max_knn_memories: bool = 130943 # the maximum number of memories that will be stored locally
+    # the maximum number of memories (~5.5GB) that will be stored locally ("./memory.memmap" should be larger than dataset)
+    max_knn_memories: bool = 999999
 configGpt = GPTConfig()
 @dataclass
 class Hyperparameters:
@@ -75,14 +79,14 @@ class Hyperparameters:
     input_bin : str         = f'{dataset}train*.bin' # input .bin to train on
     input_val_bin : str     = f'{dataset}val*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int        = 8 # batch size, in sequences, across all devices (for single T4 GPU)
-    device_batch_size : int = 2 # batch size, in sequences, per device
-    num_iterations : int    = 148 # number of iterations to run (148 for tinyshakespeare, 1480 for openwebtext 1B)
-    warmup_iters : int      = 6
+    batch_size : int        = 1 # batch size, in sequences, across all devices (shold be as low as possible)
+    device_batch_size : int = 1 # batch size, in sequences, per device
+    num_iterations : int    = 200 # number of iterations to run (100 for tinyshakespeare, 2000 for openwebtext 0.8B)
+    warmup_iters : int      = 3
     cooldown_iters : int    = 60 # number of iterations of linear warmup for triangular or trapezoidal schedule (60 for tinyshakespeare, 600 for openwebtext 1B)
     # evaluation and logging hyperparams
     val_loss_every : int    = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
-    val_steps : int         = 9
+    val_steps : int         = 2
     save_every : int        = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 # we are running on a single gpu, and one process
@@ -210,11 +214,10 @@ else:
       print(f"Resuming training from local directory")
       path = 'ckpt.pt'      
   elif init_from == 'resume_google_drive':
-      print(f"Resuming training from google_drive")    
-      from google.colab import drive
-      drive.mount('/content/drive', force_remount=True)
+      print(f"Resuming training from google_drive")
+      if not os.path.exists('/content/drive'):
+        drive.mount('/content/drive', force_remount=True)
       path = '/content/drive/My Drive/ckpt.pt'
-
   checkpoint = torch.load(path, map_location=device)
   checkpoint_model_args = checkpoint['model_args']
   # force these config attributes to be equal otherwise we can't even resume training
@@ -329,15 +332,10 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
         checkpoint = dict(step=step, code=code, model=model.state_dict(), model_args=model_args, optimizers=[opt.state_dict() for opt in optimizers])      
-        def is_colab():
-          try:
-              from google.colab import drive
-              return True
-          except ImportError:
-              return False
-        if is_colab():
+        if is_colab:
             try:
-                drive.mount('/content/drive', force_remount=True)
+                if not os.path.exists('/content/drive'):
+                    drive.mount('/content/drive', force_remount=True)
                 torch.save(checkpoint, '/content/drive/My Drive/ckpt.pt')
                 print(f'Checkpoint saved to /content/drive/My Drive/ckpt.pt')
             except Exception as e:

@@ -253,7 +253,7 @@ class KNNAttention(nn.Module):
             combined_qkv = rearrange(combined_qkv.to(torch.bfloat16), 'b h t d -> b t (h d)')
             out = self.output_matrix(combined_qkv)
             t2 = time.time()
-            logger.info(f"KNN operations completed. Time taken: {t2 - t1:.4f} seconds.")
+            logger.info(f"KNN operations completed. Time taken: {t2 - t1:.2f} seconds.")
         else:
             logger.info("No KNN memories available.")
             qkv = rearrange(qkv, 'b h t d -> b t (h d)')
