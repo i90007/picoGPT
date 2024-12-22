@@ -64,12 +64,12 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int  = 4608 # (1024, 2048, 3072, 4608) sequence length, in tokens (shold be as big as possible)
+    sequence_length : int  = 5056 # (2048, 3072, 4096, 5056) sequence length, in tokens (shold be as big as possible)
     vocab_size : int       = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int          = 12 # size of the model (48, 32, 24, 12)
     n_head : int           = 12 # size of the model (24, 20, 16, 12)
     n_embd: int            = 768 # size of the model (1536, 1280, 1024, 768)
-    dropout: float         = 0.4 # for determinism
+    dropout: float         = 0 # for determinism
     # the maximum number of memories (~5.5GB) that will be stored locally ("./memory.memmap" should be larger than dataset)
     max_knn_memories: bool = 999999
 configGpt = GPTConfig()
@@ -82,12 +82,12 @@ class Hyperparameters:
     batch_size : int        = 1 # batch size, in sequences, across all devices (shold be as low as possible)
     device_batch_size : int = 1 # batch size, in sequences, per device
     num_iterations : int    = 200 # number of iterations to run (100 for tinyshakespeare, 2000 for openwebtext 0.8B)
-    warmup_iters : int      = 3
+    warmup_iters : int      = 1
     cooldown_iters : int    = 60 # number of iterations of linear warmup for triangular or trapezoidal schedule (60 for tinyshakespeare, 600 for openwebtext 1B)
     # evaluation and logging hyperparams
     val_loss_every : int    = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
     val_steps : int         = 2
-    save_every : int        = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int        = 100 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 # we are running on a single gpu, and one process
 tokens_per_iter = args.batch_size * args.device_batch_size * args.sequence_length
@@ -308,7 +308,7 @@ for step in range(args.num_iterations + 1):
         sw_num_blocks_prev = sw_num_blocks
 
     # once in a while evaluate the validation dataset and write checkpoints
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+    if last_step:
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
