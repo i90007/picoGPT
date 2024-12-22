@@ -3,6 +3,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import numpy as np
+import multiprocessing as mp
 import time
 from einops import rearrange, einsum
 #!conda install faiss-gpu
@@ -114,48 +115,59 @@ def add_to_faiss_index(n_embd):
     return faiss.IndexFlatL2(n_embd)
 
 # k-nearest-neighbor layer for the external memory
-class KNN():
+class KNN:
     def __init__(self, n_embd, max_memories):
-        self.logger = logging.getLogger("KNN")
+        self.n_embd = n_embd
         self.max_memories = max_memories
-        self.shape = (max_memories, 2, n_embd)
         self.db_offset = 0
-        self.db_filepath = "./memory.memmap"
-        self.db = np.memmap(self.db_filepath, mode = 'w+', dtype = np.float32, shape = self.shape)
-        self.index = add_to_faiss_index(n_embd)
+        # FAISS Index
+        self.index = faiss.IndexFlatL2(n_embd)
+        # Memmap initialization
+        self.db = np.memmap(
+            "./memory.memmap", mode='w+', dtype=np.float32, shape=(max_memories, 2, n_embd)
+        )
+        # Asynchronous update
+        self.update_queue = mp.Queue()
+        self.update_process = mp.Process(
+            target=self._update_memory_worker, args=("./memory.memmap", self.update_queue, max_memories, n_embd)
+        )
+        self.update_process.start()
 
-    def add_to_db(self, new_data):
-        new_data_len = new_data.shape[0]
-        if self.db_offset + new_data_len > self.max_memories:
-            self.logger.warning("Memory limit reached. Clearing database.")
+    def _update_memory_worker(self, memmap_file, queue, max_memories, embd_dim):
+        """
+        Asynchronous process for updating the memmap file.
+        """
+        db = np.memmap(memmap_file, mode='r+', dtype=np.float32, shape=(max_memories, 2, embd_dim))
+        while True:
+            new_data = queue.get()
+            if new_data is None:
+                break  # End job
+            idx = new_data["idx"]
+            db[idx % max_memories] = new_data["value"]
+        db.flush()
+
+    def add_async(self, new_data):
+        """
+        Asynchronously adding new keys/values ​​to memmap and FAISS.
+        """
+        batch_size = new_data.shape[0]
+        if self.db_offset + batch_size > self.max_memories:
+            print("Memory limit reached. Clearing database.")
             self.clear()
-        ids = np.arange(new_data_len) + self.db_offset
-        self.db[ids % self.max_memories] = new_data.detach().cpu().to(torch.float32).numpy()
-        self.db_offset += new_data_len
-        # Write to file
-        self.db.flush()
+        # Adding keys in FAISS
+        keys = new_data[:, 0].reshape(-1, self.n_embd).detach().cpu().to(torch.float32).numpy()
+        self.index.add(keys)
+        # Adding tasks in queue
+        self.update_queue.put({
+            "idx": np.arange(batch_size) + self.db_offset,
+            "value": new_data.detach().cpu().to(torch.float32).numpy()
+        })
+        self.db_offset += batch_size
 
     def search_and_retrieve(self, query_vecs, topk):
-        start_time = time.time()
         _, indices = self.index.search(query_vecs.squeeze(0), topk)
         kvs = self.db[indices]
-
-        elapsed_time = time.time() - start_time
-        self.logger.info(f"KNN search completed in {elapsed_time:.4f}s for top-{topk}")
         return kvs
-
-    def add(self, new_data):
-        # Input is b n 2 d, flatten to (b n) 2 d
-        new_data = new_data.flatten(0,1)
-        # Add to db
-        self.add_to_db(new_data)
-        # Only keys are used in knn index
-        keys, _ = new_data.unbind(dim=-2)
-        keys = keys.detach().cpu().to(torch.float32).numpy()
-        # Add (b n) d tensors to index
-        keys = np.ascontiguousarray(keys)
-        # Add to index
-        self.index.add(keys)
 
     def search(self, query_vecs, topk):
         query_batch_size, query_seq_len = query_vecs.shape[0], query_vecs.shape[1]
@@ -169,20 +181,29 @@ class KNN():
         return kvs.to(device)
 
     def clear(self):
+        """
+        Clearing FAISS and memmap.
+        """
         self.index.reset()
         self.db[:] = 0
+        self.db.flush()
         self.db_offset = 0
+
+    def close(self):
+        """
+        Terminating an asynchronous process.
+        """
+        self.update_queue.put(None)
+        self.update_process.join()
 
 # k-nearest-neibhor attention block for the external memory
 class KNNAttention(nn.Module):
     def __init__(self, config, knn):
         super().__init__()
-        self.sequence_length = config.sequence_length
         self.n_head = config.n_head
         assert config.n_embd % config.n_head == 0
         self.scale = config.n_embd / config.n_head ** -0.5
         self.max_memories = config.max_knn_memories
-        self.dropout = config.dropout
         # key, query, value projections for all heads, but in a batch
         self.query_matrix = nn.Linear(config.n_embd, config.n_embd)
         self.key_matrix = nn.Linear(config.n_embd, config.n_embd)
@@ -190,7 +211,6 @@ class KNNAttention(nn.Module):
         self.output_matrix = nn.Linear(config.n_embd, config.n_embd)
         # regularization
         self.dropout = nn.Dropout(config.dropout)
-
         self.gate_bias = nn.Parameter(torch.randn(config.n_head, 1, 1))
         self.knn = knn
 
@@ -199,24 +219,23 @@ class KNNAttention(nn.Module):
         logger.setLevel(logging.INFO)
 
         device = x.device
-        batch_size, sequence_length = x.shape[:2]
-        x = x.squeeze(1)
+        _, sequence_length = x.shape[:2]
+        x = x.squeeze(1) # deleting batch
+        # Getting queries, keys, and values
         queries = self.query_matrix(x)
         keys = self.key_matrix(x)
         values = self.value_matrix(x)
-
+        # Normalizing
         queries = F.normalize(queries, dim=-1)
         keys = F.normalize(keys, dim=-1)
-
         ### LOCAL ATTENTION
         queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.n_head)
         keys    = rearrange(keys, 'b t (h d) -> b h t d', h = self.n_head)
         qk      = einsum(queries, keys, 'b h i d, b h j d -> b h i j')
-
+        # Masking
         i, j = qk.shape[-2:]
         qk = qk * self.scale
-
-        mask = torch.ones((i,j), dtype = torch.bool, device=device).triu(j-i+1) ########
+        mask = torch.ones((i,j), dtype = torch.bool, device=device).triu(j-i+1)
         qk = qk.masked_fill(mask, float('-inf'))
 
         qk = F.softmax(qk, dim=-1)
@@ -224,46 +243,40 @@ class KNNAttention(nn.Module):
 
         values = rearrange(values, 'b t (h d) -> b h t d', h = self.n_head)
         qkv = qk@values
-
         ### KNN ATTENTION
         # If there are knn memories (we're not on the first segment) then perform knn attention
         if self.knn.index.ntotal >= self.max_memories:
             logger.info("Clearing KNN memories due to limit reached.")
             self.knn.clear()
         if self.knn.index.ntotal > 0:
-            t1 = time.time()
             # Convert queries to search form
-            queries = rearrange(queries, 'b h t d -> b t (h d)')
-            mem_kv = self.knn.search(queries, topk = 3) # returns b t k 2 d
-            mem_k, mem_v = mem_kv.unbind(dim = -2)
+            queries_flat = rearrange(queries, 'b h t d -> b t (h d)')
+            kv_memories = self.knn.search(queries_flat, topk=3) # returns b t k 2 d
+            mem_k, mem_v = kv_memories.unbind(dim=-2)
+            # Convert queries to attention form
             mem_k = rearrange(mem_k, 'b t k (h d) -> b h t k d', h = self.n_head)
             mem_v = rearrange(mem_v, 'b t k (h d) -> b h t k d', h = self.n_head)
-
-            # Convert queries to attention form
-            queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.n_head)
+            # Calculating weights
             mem_qk = einsum(queries.to(torch.float32), mem_k, 'b h t d, b h t k d -> b h t k')
             mem_qk = mem_qk * self.scale
 
             mem_qk = F.softmax(mem_qk, dim = -1)
             mem_qk = self.dropout(mem_qk)
             mem_qkv = einsum(mem_qk, mem_v, 'b h t k, b h t k d -> b h t d')
-
             # Combined attentions
             combined_qkv = mem_qkv * self.gate_bias + qkv * (1 - self.gate_bias)
             combined_qkv = rearrange(combined_qkv.to(torch.bfloat16), 'b h t d -> b t (h d)')
             out = self.output_matrix(combined_qkv)
-            t2 = time.time()
-            logger.info(f"KNN operations completed. Time taken: {t2 - t1:.2f} seconds.")
         else:
             logger.info("No KNN memories available.")
             qkv = rearrange(qkv, 'b h t d -> b t (h d)')
             out = self.output_matrix(qkv)
-        # new memories
-        keys = rearrange(keys, 'b h t d -> b t (h d)', h = self.n_head)
-        values = rearrange(values, 'b h t d -> b t (h d)', h = self.n_head)
+        ### MEMORY UPDATE (ASYNCHRONY)
+        keys = rearrange(keys, 'b h t d -> b t (h d)', h=self.n_head)
+        values = rearrange(values, 'b h t d -> b t (h d)', h=self.n_head)
         kv_memories = torch.stack((keys, values), dim=-2) # (batch, sequence_len, 2, dimension)
         _, kv_memories = kv_memories[:, :-sequence_length], kv_memories[:, -sequence_length:]
-        self.knn.add(kv_memories)
+        self.knn.add_async(kv_memories) # asynchrony adding
 
         return out
 

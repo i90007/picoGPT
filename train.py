@@ -2,29 +2,16 @@
 https://github.com/i90007/picoGPT
 The training script for running on a single gpu
 Little logs:
-1) After update, tinyshakespeare, 1 T4 GPU, Google Colab, 1h. 23m.
+1) openwebtext 0.8B, 1 T4 GPU, Google Colab, .
 number of parameters: 628.17M
-sequence_length = 4*1024
+sequence_length = 4096
 n_layer         = 12
 n_head          = 12
 n_embd          = 768
-dropout         = 0.4
-max_knn_memories= 130943
-batch_size      = 2
-num_iterations  = 148
-warmup_iters    = 15
-tokens per iteration will be: 8,192
-step: 148/148 val_loss: 5.062 train_time:3285885ms step_avg: 23810.76ms
-2) openwebtext, 1 T4 GPU, Google Colab, .
-number of parameters: 628.17M
-sequence_length = 4*1024
-n_layer         = 12
-n_head          = 12
-n_embd          = 768
-dropout         = 0.4
-max_knn_memories= 99999
-batch_size      = 16
-num_iterations  = 100
+dropout         = 0.1
+max_knn_memories= 500000
+num_iterations  = 200
+step: 200/200 val_loss: 6.500
 """
 import os
 import sys
@@ -38,7 +25,7 @@ import torch
 import torch._inductor.config as config
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
-from model import MemorizingGPT, CastedLinear
+from model import MemorizingGPT, CastedLinear, KNN
 def is_colab():
   try:
       from google.colab import drive
@@ -64,14 +51,14 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int  = 4992 # (2048, 3072, 4096, 5056) sequence length, in tokens (shold be as big as possible)
+    sequence_length : int  = 4608 # (1024, 2048, 3072, 4608) sequence length, in tokens (shold be as big as possible)
     vocab_size : int       = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int          = 12 # size of the model (48, 32, 24, 12)
     n_head : int           = 12 # size of the model (24, 20, 16, 12)
     n_embd: int            = 768 # size of the model (1536, 1280, 1024, 768)
-    dropout: float         = 0 # for determinism
+    dropout: float         = 0.1 # if "./memory.memmap" larger than dataset, dropout should be always 0.1
     # the maximum number of memories (~5.5GB) that will be stored locally ("./memory.memmap" should be larger than dataset)
-    max_knn_memories: bool = 999999
+    max_knn_memories: bool = 500000
 configGpt = GPTConfig()
 @dataclass
 class Hyperparameters:
@@ -308,7 +295,7 @@ for step in range(args.num_iterations + 1):
         sw_num_blocks_prev = sw_num_blocks
 
     # once in a while evaluate the validation dataset and write checkpoints
-    if last_step:
+    if last_step or step == args.save_every:
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
