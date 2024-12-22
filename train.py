@@ -64,7 +64,7 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int  = 5056 # (2048, 3072, 4096, 5056) sequence length, in tokens (shold be as big as possible)
+    sequence_length : int  = 4992 # (2048, 3072, 4096, 5056) sequence length, in tokens (shold be as big as possible)
     vocab_size : int       = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int          = 12 # size of the model (48, 32, 24, 12)
     n_head : int           = 12 # size of the model (24, 20, 16, 12)
