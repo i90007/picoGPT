@@ -74,7 +74,7 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int    = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
     val_steps : int         = 2
-    save_every : int        = 100 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int        = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 # we are running on a single gpu, and one process
 tokens_per_iter = args.batch_size * args.device_batch_size * args.sequence_length
