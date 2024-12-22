@@ -189,13 +189,6 @@ class KNN:
         self.db.flush()
         self.db_offset = 0
 
-    def close(self):
-        """
-        Terminating an asynchronous process.
-        """
-        self.update_queue.put(None)
-        self.update_process.join()
-
 # k-nearest-neibhor attention block for the external memory
 class KNNAttention(nn.Module):
     def __init__(self, config, knn):
