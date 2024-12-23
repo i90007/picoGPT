@@ -51,30 +51,30 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int  = 4608 # (1024, 2048, 3072, 4608) sequence length, in tokens (shold be as big as possible)
-    vocab_size : int       = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer : int          = 12 # size of the model (48, 32, 24, 12)
-    n_head : int           = 12 # size of the model (24, 20, 16, 12)
-    n_embd: int            = 768 # size of the model (1536, 1280, 1024, 768)
-    dropout: float         = 0.1 # if "./memory.memmap" larger than dataset, dropout should be always 0.1
-    # the maximum number of memories (~5.5GB) that will be stored locally ("./memory.memmap" should be larger than dataset)
-    max_knn_memories: bool = 500000
+    sequence_length : int = 3072 # (1024, 2048, 3072, 4416) sequence length, in tokens (shold be as big as possible)
+    vocab_size : int      = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer : int         = 24 # size of the model (48, 32, 24, 12)
+    n_head : int          = 16 # size of the model (24, 20, 16, 12)
+    n_embd: int           = 1024 # size of the model (1536, 1280, 1024, 768)
+    dropout: float        = 0.4
+    # the maximum number of memories (~2.7GB) that will be stored locally
+    max_knn_memories: bool= 500000
 configGpt = GPTConfig()
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str         = f'{dataset}train*.bin' # input .bin to train on
-    input_val_bin : str     = f'{dataset}val*.bin' # input .bin to eval validation loss on
+    input_bin : str        = f'{dataset}train*.bin' # input .bin to train on
+    input_val_bin : str    = f'{dataset}val*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int        = 1 # batch size, in sequences, across all devices (shold be as low as possible)
-    device_batch_size : int = 1 # batch size, in sequences, per device
-    num_iterations : int    = 300 # number of iterations to run (100 for tinyshakespeare, 2000 for openwebtext 0.8B)
-    warmup_iters : int      = 1
-    cooldown_iters : int    = 60 # number of iterations of linear warmup for triangular or trapezoidal schedule (60 for tinyshakespeare, 600 for openwebtext 1B)
+    batch_size : int       = 1 # batch size, in sequences, across all devices (shold be as low as possible)
+    device_batch_size : int= 1 # batch size, in sequences, per device
+    num_iterations : int   = 300 # (100, 200, 300, 400) number of iterations to run (100 for tinyshakespeare, 1000 for openwebtext 0.8B)
+    warmup_iters : int     = 1
+    cooldown_iters : int   = 60 # number of iterations of linear warmup for triangular or trapezoidal schedule (60 for tinyshakespeare, 600 for openwebtext 1B)
     # evaluation and logging hyperparams
-    val_loss_every : int    = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
-    val_steps : int         = 2
-    save_every : int        = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    val_loss_every : int   = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
+    val_steps : int        = 3
+    save_every : int       = 100 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 # we are running on a single gpu, and one process
 tokens_per_iter = args.batch_size * args.device_batch_size * args.sequence_length
@@ -313,7 +313,7 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
-    if last_step or (args.save_every > 0 and step % args.save_every == 0):
+    if last_step or step == args.save_every:
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
