@@ -2,16 +2,26 @@
 https://github.com/i90007/picoGPT
 The training script for running on a single gpu
 Little logs:
-1) openwebtext 0.8B, 1 T4 GPU, Google Colab, .
+1) openwebtext 0.8B, 1 T4 GPU, Google Colab
 number of parameters: 628.17M
-sequence_length = 4096
+sequence_length = 4416
 n_layer         = 12
 n_head          = 12
 n_embd          = 768
 dropout         = 0.1
 max_knn_memories= 500000
-num_iterations  = 200
-step: 200/200 val_loss: 6.500
+num_iterations  = 400
+step: 400 val_loss: 6.500
+2) openwebtext 0.8B, 1 T4 GPU, Google Colab
+number of parameters: 
+sequence_length = 2944
+n_layer         = 24
+n_head          = 16
+n_embd          = 1024
+dropout         = 0.4
+max_knn_memories= 500000
+num_iterations  = 300
+step: 300 val_loss: 
 """
 import os
 import sys
@@ -51,7 +61,7 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int = 3072 # (1024, 2048, 3072, 4416) sequence length, in tokens (shold be as big as possible)
+    sequence_length : int = 2944 # (1024, 2048, 2944, 4416) sequence length, in tokens (shold be as big as possible)
     vocab_size : int      = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int         = 24 # size of the model (48, 32, 24, 12)
     n_head : int          = 16 # size of the model (24, 20, 16, 12)
