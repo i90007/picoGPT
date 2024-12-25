@@ -2,26 +2,16 @@
 https://github.com/i90007/picoGPT
 The training script for running on a single gpu
 Little logs:
-1) openwebtext 0.8B, 1 T4 GPU, Google Colab
-number of parameters: 628.17M
-sequence_length = 4416
-n_layer         = 12
-n_head          = 12
-n_embd          = 768
-dropout         = 0.1
-max_knn_memories= 500000
-num_iterations  = 400
-step: 400 val_loss: 6.500
-2) openwebtext 0.8B, 1 T4 GPU, Google Colab
-number of parameters: 
-sequence_length = 2496
+1) openwebtext 0.8B, 1 T4 GPU, Google Colab,
+number of parameters: 1233.39M
+sequence_length = 2240
 n_layer         = 24
 n_head          = 16
 n_embd          = 1024
 dropout         = 0.4
 max_knn_memories= 500000
-num_iterations  = 300
-step: 300 val_loss: 
+num_iterations  = 400
+step: 100 val_loss: 7.281
 """
 import os
 import sys
@@ -61,12 +51,12 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int = 2496 # (960, 1984, 2496, 4416) sequence length, in tokens (shold be as big as possible)
+    sequence_length : int = 2240 # (960, 1984, 2240, 4416) sequence length, in tokens (shold be as big as possible)
     vocab_size : int      = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int         = 24 # size of the model (48, 32, 24, 12)
     n_head : int          = 16 # size of the model (24, 20, 16, 12)
     n_embd: int           = 1024 # size of the model (1536, 1280, 1024, 768)
-    dropout: float        = 0.4
+    dropout: float        = 0.4 # (0.2, 0.3, 0.4, 0.5)
     # the maximum number of memories (~2.7GB) that will be stored locally
     max_knn_memories: bool= 500000
 configGpt = GPTConfig()
