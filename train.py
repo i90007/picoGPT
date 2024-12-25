@@ -14,7 +14,7 @@ num_iterations  = 400
 step: 400 val_loss: 6.500
 2) openwebtext 0.8B, 1 T4 GPU, Google Colab
 number of parameters: 
-sequence_length = 2944
+sequence_length = 2496
 n_layer         = 24
 n_head          = 16
 n_embd          = 1024
@@ -61,7 +61,7 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int = 2944 # (1024, 2048, 2944, 4416) sequence length, in tokens (shold be as big as possible)
+    sequence_length : int = 2496 # (960, 1984, 2496, 4416) sequence length, in tokens (shold be as big as possible)
     vocab_size : int      = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int         = 24 # size of the model (48, 32, 24, 12)
     n_head : int          = 16 # size of the model (24, 20, 16, 12)
@@ -323,7 +323,7 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
-    if last_step or step == args.save_every:
+    if last_step or (step > 0 and step % args.save_every == 0):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)

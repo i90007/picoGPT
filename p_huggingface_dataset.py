@@ -24,7 +24,7 @@ if __name__ == '__main__':
         num_proc=num_proc
     )
     # owt by default only contains the 'train' split, so create a test split
-    split_dataset       = dataset.train_test_split(test_size=0.0005, seed=2357, shuffle=True)
+    split_dataset       = dataset.train_test_split(test_size=0.001, seed=2357, shuffle=True)
     split_dataset['val']= split_dataset.pop('test') # rename the test split to val
 
     def limit_training_part():
