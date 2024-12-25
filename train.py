@@ -78,7 +78,7 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int       = 1 # batch size, in sequences, across all devices (shold be as low as possible)
     device_batch_size : int= 1 # batch size, in sequences, per device
-    num_iterations : int   = 300 # (100, 200, 300, 400) number of iterations to run (100 for tinyshakespeare, 1000 for openwebtext 0.8B)
+    num_iterations : int   = 400 # (200, 300, 400, 500) number of iterations to run (100 for tinyshakespeare, 1000 for openwebtext 0.8B)
     warmup_iters : int     = 1
     cooldown_iters : int   = 60 # number of iterations of linear warmup for triangular or trapezoidal schedule (60 for tinyshakespeare, 600 for openwebtext 1B)
     # evaluation and logging hyperparams
