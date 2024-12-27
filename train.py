@@ -4,7 +4,7 @@ The training script for running on a single gpu
 Little logs:
 1) openwebtext 0.8B, 1 T4 GPU, Google Colab,
 number of parameters: 1233.39M
-sequence_length = 2240
+sequence_length = 1664
 n_layer         = 24
 n_head          = 16
 n_embd          = 1024
@@ -51,7 +51,7 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int = 2240 # (960, 1984, 2240, 4416) sequence length, in tokens (shold be as big as possible)
+    sequence_length : int = 1664 # (-, 960, 1664, 4416) sequence length, in tokens (shold be as big as possible)
     vocab_size : int      = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int         = 24 # size of the model (48, 32, 24, 12)
     n_head : int          = 16 # size of the model (24, 20, 16, 12)
