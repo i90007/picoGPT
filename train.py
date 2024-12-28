@@ -4,7 +4,7 @@ The training script for running on a single gpu
 Little logs:
 1) openwebtext 0.8B, 1 T4 GPU, Google Colab,
 number of parameters: 1233.39M
-sequence_length = 1344
+sequence_length = 1024
 n_layer         = 24
 n_head          = 16
 n_embd          = 1024
@@ -13,7 +13,10 @@ max_knn_memories= 500000
 num_iterations  = 400
 step: 100 val_loss: 7.281
 """
+import gc
 import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
@@ -51,7 +54,7 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int = 1344 # (-, -, 1344, 4416) sequence length, in tokens (shold be as big as possible)
+    sequence_length : int = 1024 # (-, -, 1024, 4416) sequence length, in tokens (shold be as big as possible)
     vocab_size : int      = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int         = 24 # size of the model (48, 32, 24, 12)
     n_head : int          = 16 # size of the model (24, 20, 16, 12)
@@ -205,7 +208,10 @@ else:
       if not os.path.exists('/content/drive'):
         drive.mount('/content/drive', force_remount=True)
       path = '/content/drive/My Drive/ckpt.pt'
-  checkpoint = torch.load(path, map_location=device)
+  torch.cuda.empty_cache()
+  gc.collect()
+  torch.cuda.ipc_collect()
+  checkpoint = torch.load(path)
   checkpoint_model_args = checkpoint['model_args']
   # force these config attributes to be equal otherwise we can't even resume training
   for k in ['n_layer', 'n_head', 'n_embd', 'dropout', 'vocab_size', 'max_knn_memories']:
@@ -277,6 +283,9 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.time()
 # begin training
+torch.cuda.empty_cache()
+gc.collect()
+torch.cuda.ipc_collect()
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
