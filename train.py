@@ -3,15 +3,15 @@ https://github.com/i90007/picoGPT
 The training script for running on a single gpu
 Little logs:
 1) openwebtext 0.8B, 1 T4 GPU, Google Colab,
-number of parameters: 1233.39M
+number of parameters: 1208.23M
 sequence_length = 1088
 n_layer         = 22
 n_head          = 16
 n_embd          = 1024
 dropout         = 0.4
 max_knn_memories= 500000
-num_iterations  = 400
-step: 100 val_loss: 7.281
+num_iterations  = 500
+step: 0-400 val_loss: 6.500 train_time:2278108ms step_avg: 5841.30ms
 """
 import gc
 import os
@@ -71,7 +71,7 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int       = 1 # batch size, in sequences, across all devices (shold be as low as possible)
     device_batch_size : int= 1 # batch size, in sequences, per device
-    num_iterations : int   = 400 # (200, 300, 400, 500) number of iterations to run (100 for tinyshakespeare, 1000 for openwebtext 0.8B)
+    num_iterations : int   = 500 # (-, -, 500, 600) number of iterations to run (100 for tinyshakespeare, 1000 for openwebtext 0.8B)
     warmup_iters : int     = 1
     cooldown_iters : int   = 60 # number of iterations of linear warmup for triangular or trapezoidal schedule (60 for tinyshakespeare, 600 for openwebtext 1B)
     # evaluation and logging hyperparams
