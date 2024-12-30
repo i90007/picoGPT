@@ -76,7 +76,7 @@ class Hyperparameters:
     cooldown_iters : int   = 60 # number of iterations of linear warmup for triangular or trapezoidal schedule (60 for tinyshakespeare, 600 for openwebtext 1B)
     # evaluation and logging hyperparams
     val_loss_every : int   = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
-    val_steps : int        = 5
+    val_steps : int        = 6
     save_every : int       = 100 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 # we are running on a single gpu, and one process
@@ -375,6 +375,6 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
     approx_time = training_time_ms + time.time() - t0
-    print(f"step: {step+1}/{args.num_iterations} train_time: {approx_time:.0f}s step_avg: {approx_time/timed_steps:.2f}ms")
+    print(f"step: {step+1}/{args.num_iterations} train_time: {approx_time}s step_avg: {approx_time/timed_steps:.2f}ms")
     
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
