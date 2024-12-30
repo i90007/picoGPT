@@ -2,9 +2,9 @@
 https://github.com/i90007/picoGPT
 The training script for running on a single gpu
 Little logs:
-1) openwebtext 0.8B, 1 T4 GPU, Google Colab,
+1) openwebtext 0.8B, 1 T4 GPU, Google Colab, 53m.
 number of parameters: 1208.23M
-sequence_length = 1088
+sequence_length = 1152
 n_layer         = 22
 n_head          = 16
 n_embd          = 1024
@@ -54,12 +54,12 @@ if not torch.cuda.is_available():
 # -----------------------------------------------------------------------------
 @dataclass
 class GPTConfig:
-    sequence_length : int = 1088 # (-, -, 1088, 4416) sequence length, in tokens (shold be as big as possible)
+    sequence_length : int = 1152 # (-, -, 1152, 4416) sequence length, in tokens (shold be as big as possible)
     vocab_size : int      = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer : int         = 22 # size of the model (-, -, 22, 12)
     n_head : int          = 16 # size of the model (-, -, 16, 12)
     n_embd: int           = 1024 # size of the model (-, -, 1024, 768)
-    dropout: float        = 0.4 # (0.2, 0.3, 0.4, 0.5)
+    dropout: float        = 0.4 # (-, -, 0.4, 0.5)
     # the maximum number of memories (~2.7GB) that will be stored locally
     max_knn_memories: bool= 500000
 configGpt = GPTConfig()
@@ -307,7 +307,7 @@ for step in range(args.num_iterations + 1):
     if last_step or step == args.save_every:
         # stop the clock
         torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.time() - t0)
+        training_time_ms += time.time() - t0
         # run validation batches
         model.eval()
         val_loss = 0.0
@@ -317,7 +317,7 @@ for step in range(args.num_iterations + 1):
                 val_loss += model(sliding_window_num_blocks, x_val, y_val)
         val_loss /= args.val_steps
         # log val loss to console and to logfile
-        print(f'step: {step}/{args.num_iterations} val_loss: {val_loss:.3f} train_time:{training_time_ms:.0f}ms step_avg: {training_time_ms/(timed_steps-1):.2f}ms')
+        print(f'step: {step}/{args.num_iterations} val_loss: {val_loss:.3f} train_time:{training_time_ms}s step_avg: {training_time_ms/(timed_steps-1):.2f}ms')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -325,7 +325,7 @@ for step in range(args.num_iterations + 1):
     if last_step or (step > 0 and step % args.save_every == 0):
         # stop the clock
         torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.time() - t0)
+        training_time_ms += time.time() - t0
         # save the state of the training process
         checkpoint = dict(step=step, code=code, model=model.state_dict(), model_args=model_args, optimizers=[opt.state_dict() for opt in optimizers])      
         if is_colab:
@@ -374,7 +374,7 @@ for step in range(args.num_iterations + 1):
     model.zero_grad(set_to_none=True)
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
-    approx_time = training_time_ms + 1000 * (time.time() - t0)
-    print(f"step: {step+1}/{args.num_iterations} train_time: {approx_time:.0f}ms step_avg: {approx_time/timed_steps:.2f}ms")
+    approx_time = training_time_ms + time.time() - t0
+    print(f"step: {step+1}/{args.num_iterations} train_time: {approx_time:.0f}s step_avg: {approx_time/timed_steps:.2f}ms")
     
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
