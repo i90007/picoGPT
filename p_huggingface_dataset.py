@@ -10,7 +10,7 @@ from datasets import load_dataset # huggingface datasets
 # good number to use is ~order number of cpu cores // 2
 num_proc     = 3
 # Target number of tokens. If "0" - limiting is off
-target_tokens= 800_000_000
+target_tokens= 2_000_000_000
 enc          = tiktoken.get_encoding("gpt2")
 
 if __name__ == '__main__':

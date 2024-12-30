@@ -10,8 +10,9 @@ n_head          = 16
 n_embd          = 1024
 dropout         = 0.4
 max_knn_memories= 500000
-num_iterations  = 500
+num_iterations  = 490
 step: 0-400 val_loss: 6.500 train_time:2278108ms step_avg: 5841.30ms
+step: 400-900 val_loss: 6.312 train_time:2953.8072106838226s step_avg: 6.03ms
 """
 import gc
 import os
@@ -317,7 +318,7 @@ for step in range(args.num_iterations + 1):
                 val_loss += model(sliding_window_num_blocks, x_val, y_val)
         val_loss /= args.val_steps
         # log val loss to console and to logfile
-        print(f'step: {step}/{args.num_iterations} val_loss: {val_loss:.3f} train_time:{training_time_ms}s step_avg: {training_time_ms/(timed_steps-1):.2f}ms')
+        print(f'step: {step}/{args.num_iterations} val_loss: {val_loss:.3f} train_time: {training_time_ms:.0f}s step_avg: {training_time_ms/(timed_steps-1):.1f}s')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -375,6 +376,6 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
     approx_time = training_time_ms + time.time() - t0
-    print(f"step: {step+1}/{args.num_iterations} train_time: {approx_time}s step_avg: {approx_time/timed_steps:.2f}ms")
+    print(f"step: {step+1}/{args.num_iterations} train_time: {approx_time:.0f}s step_avg: {approx_time/timed_steps:.0f}s")
     
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
