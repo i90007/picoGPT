@@ -60,7 +60,7 @@ class GPTConfig:
     n_layer : int         = 22 # size of the model (-, -, 22, 12)
     n_head : int          = 16 # size of the model (-, -, 16, 12)
     n_embd: int           = 1024 # size of the model (-, -, 1024, 768)
-    dropout: float        = 0.4 # (-, -, 0.4, 0.5)
+    dropout: float        = 0.1 # (-, -, 0.1, 0.2)
     # the maximum number of memories (~2.7GB) that will be stored locally
     max_knn_memories: bool= 500000
 configGpt = GPTConfig()
@@ -72,12 +72,12 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int       = 1 # batch size, in sequences, across all devices (shold be as low as possible)
     device_batch_size : int= 1 # batch size, in sequences, per device
-    num_iterations : int   = 500 # (-, -, 500, 600) number of iterations to run (100 for tinyshakespeare, 1000 for openwebtext 0.8B)
+    num_iterations : int   = 490 # (-, -, 490, 600) number of iterations to run (100 for tinyshakespeare, 1000 for openwebtext 0.8B)
     warmup_iters : int     = 1
     cooldown_iters : int   = 60 # number of iterations of linear warmup for triangular or trapezoidal schedule (60 for tinyshakespeare, 600 for openwebtext 1B)
     # evaluation and logging hyperparams
     val_loss_every : int   = 10 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
-    val_steps : int        = 6
+    val_steps : int        = 7
     save_every : int       = 100 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 # we are running on a single gpu, and one process
@@ -264,8 +264,7 @@ def get_lr(it):
         return 1.0
     # 3) linear cooldown
     else:
-        decay_ratio = (args.num_iterations - it) / args.cooldown_iters
-        return decay_ratio
+        return (args.num_iterations - it) / args.cooldown_iters
 # resume optimizers
 if init_from == 'resume':
     optimizer1.load_state_dict(checkpoint['optimizers'][0])
