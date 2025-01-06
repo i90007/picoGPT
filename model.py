@@ -78,7 +78,7 @@ class CausalSelfAttention(nn.Module):
         nn.init.xavier_uniform_(self.c_proj.weight)
 
     def forward(self, x, vi, block_mask):
-        B, _, T, _ = x.size()  # batch size, sequence length (T), embedding_dim
+        B, T, _ = x.size()  # batch size, sequence length (T), embedding_dim
         assert B == 1, "Must use batch size = 1 for FlexAttention"
 
         # Apply linear transformations
@@ -116,10 +116,12 @@ def add_to_faiss_index(n_embd):
 
 # k-nearest-neighbor layer for the external memory
 class KNN:
-    def __init__(self, n_embd, max_memories):
+    def __init__(self, n_embd, max_memories, vocab_size, device="cuda"):
         self.n_embd = n_embd
         self.max_memories = max_memories
         self.db_offset = 0
+        # Layer for projection
+        self.projection_layer = nn.Linear(vocab_size, n_embd).to(device)
         # FAISS Index
         self.index = faiss.IndexFlatL2(n_embd)
         # Memmap initialization
@@ -132,6 +134,9 @@ class KNN:
             target=self._update_memory_worker, args=("./memory.memmap", self.update_queue, max_memories, n_embd)
         )
         self.update_process.start()
+
+    def get_parameters(self):
+        return self.projection_layer.parameters()
 
     def _update_memory_worker(self, memmap_file, queue, max_memories, embd_dim):
         """
@@ -155,123 +160,41 @@ class KNN:
             print("Memory limit reached. Clearing database.")
             self.clear()
         # Adding keys in FAISS
-        keys = new_data[:, 0].reshape(-1, self.n_embd).detach().cpu().to(torch.float32).numpy()
+        reduced_logits = self.projection_layer(new_data)
+        keys = reduced_logits.detach().cpu().to(torch.float32).numpy()
         self.index.add(keys)
         # Adding tasks in queue
         self.update_queue.put({
             "idx": np.arange(batch_size) + self.db_offset,
-            "value": new_data.detach().cpu().to(torch.float32).numpy()
+            "value": reduced_logits.detach().cpu().to(torch.float32).numpy()
         })
         self.db_offset += batch_size
 
-    def search_and_retrieve(self, query_vecs, topk):
-        _, indices = self.index.search(query_vecs.squeeze(0), topk)
-        kvs = self.db[indices]
-        return kvs
+    def dynamic_topk(self, current_step, total_steps, min_k=1, max_k=10):
+        progress = current_step / total_steps
+        return int(min_k + (max_k - min_k) * (progress**0.5))
 
-    def search(self, query_vecs, topk):
-        query_batch_size, query_seq_len = query_vecs.shape[0], query_vecs.shape[1]
-        device = query_vecs.device
-        # Input is b n d, flatten to (b n) d
-        query_vecs = query_vecs.to(torch.float32).detach().cpu().numpy()
-        kvs = self.search_and_retrieve(np.ascontiguousarray(query_vecs), topk)
-        # kvs are (b n) k 2 d, unflatten to b n k 2 d
-        kvs = torch.tensor(kvs)
-        kvs = torch.unflatten(kvs, 0, (query_batch_size, query_seq_len))
-        return kvs.to(device)
+    def search_and_retrieve(self, query_vecs, current_step, total_steps):
+        topk = self.dynamic_topk(current_step, total_steps)
+
+        query_vecs = query_vecs.squeeze(0).to(dtype=torch.float32)
+        query_vecs = query_vecs.detach().cpu().numpy()
+
+        _, indices = self.index.search(query_vecs, topk)
+        kvs = np.take(self.db, indices, axis=0)
+
+        if current_step % 50 == 0:
+          print(f"Step {current_step}, Dynamic topk: {topk}")
+        return kvs
 
     def clear(self):
         """
         Clearing FAISS and memmap.
         """
         self.index.reset()
-        self.db[:] = 0
+        self.db[:] = np.zeros_like(self.db)
         self.db.flush()
         self.db_offset = 0
-
-# k-nearest-neibhor attention block for the external memory
-class KNNAttention(nn.Module):
-    def __init__(self, config, knn):
-        super().__init__()
-        self.n_head = config.n_head
-        assert config.n_embd % config.n_head == 0
-        self.scale = config.n_embd / config.n_head ** -0.5
-        self.max_memories = config.max_knn_memories
-        # key, query, value projections for all heads, but in a batch
-        self.query_matrix = nn.Linear(config.n_embd, config.n_embd)
-        self.key_matrix = nn.Linear(config.n_embd, config.n_embd)
-        self.value_matrix = nn.Linear(config.n_embd, config.n_embd)
-        self.output_matrix = nn.Linear(config.n_embd, config.n_embd)
-        # regularization
-        self.dropout = nn.Dropout(config.dropout)
-        self.gate_bias = nn.Parameter(torch.randn(config.n_head, 1, 1))
-        self.knn = knn
-
-    def forward(self, x): # batch_size, sequence_length, embedding_dimension
-        logger = logging.getLogger(__name__)
-        logger.setLevel(logging.INFO)
-
-        device = x.device
-        _, sequence_length = x.shape[:2]
-        x = x.squeeze(1) # deleting batch
-        # Getting queries, keys, and values
-        queries = self.query_matrix(x)
-        keys = self.key_matrix(x)
-        values = self.value_matrix(x)
-        # Normalizing
-        queries = F.normalize(queries, dim=-1)
-        keys = F.normalize(keys, dim=-1)
-        ### LOCAL ATTENTION
-        queries = rearrange(queries, 'b t (h d) -> b h t d', h = self.n_head)
-        keys    = rearrange(keys, 'b t (h d) -> b h t d', h = self.n_head)
-        qk      = einsum(queries, keys, 'b h i d, b h j d -> b h i j')
-        # Masking
-        i, j = qk.shape[-2:]
-        qk = qk * self.scale
-        mask = torch.ones((i,j), dtype = torch.bool, device=device).triu(j-i+1)
-        qk = qk.masked_fill(mask, float('-inf'))
-
-        qk = F.softmax(qk, dim=-1)
-        qk = self.dropout(qk)
-
-        values = rearrange(values, 'b t (h d) -> b h t d', h = self.n_head)
-        qkv = qk@values
-        ### KNN ATTENTION
-        # If there are knn memories (we're not on the first segment) then perform knn attention
-        if self.knn.index.ntotal >= self.max_memories:
-            logger.info("Clearing KNN memories due to limit reached.")
-            self.knn.clear()
-        if self.knn.index.ntotal > 0:
-            # Convert queries to search form
-            queries_flat = rearrange(queries, 'b h t d -> b t (h d)')
-            kv_memories = self.knn.search(queries_flat, topk=3) # returns b t k 2 d
-            mem_k, mem_v = kv_memories.unbind(dim=-2)
-            # Convert queries to attention form
-            mem_k = rearrange(mem_k, 'b t k (h d) -> b h t k d', h = self.n_head)
-            mem_v = rearrange(mem_v, 'b t k (h d) -> b h t k d', h = self.n_head)
-            # Calculating weights
-            mem_qk = einsum(queries.to(torch.float32), mem_k, 'b h t d, b h t k d -> b h t k')
-            mem_qk = mem_qk * self.scale
-
-            mem_qk = F.softmax(mem_qk, dim = -1)
-            mem_qk = self.dropout(mem_qk)
-            mem_qkv = einsum(mem_qk, mem_v, 'b h t k, b h t k d -> b h t d')
-            # Combined attentions
-            combined_qkv = mem_qkv * self.gate_bias + qkv * (1 - self.gate_bias)
-            combined_qkv = rearrange(combined_qkv.to(torch.bfloat16), 'b h t d -> b t (h d)')
-            out = self.output_matrix(combined_qkv)
-        else:
-            logger.info("No KNN memories available.")
-            qkv = rearrange(qkv, 'b h t d -> b t (h d)')
-            out = self.output_matrix(qkv)
-        ### MEMORY UPDATE (ASYNCHRONY)
-        keys = rearrange(keys, 'b h t d -> b t (h d)', h=self.n_head)
-        values = rearrange(values, 'b h t d -> b t (h d)', h=self.n_head)
-        kv_memories = torch.stack((keys, values), dim=-2) # (batch, sequence_len, 2, dimension)
-        _, kv_memories = kv_memories[:, :-sequence_length], kv_memories[:, -sequence_length:]
-        self.knn.add_async(kv_memories) # asynchrony adding
-
-        return out
 
 # Multi level perceptron
 class MLP(nn.Module):
@@ -329,9 +252,7 @@ class MemorizingGPT(nn.Module):
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
-        knn = KNN(config.n_embd, config.max_knn_memories)
         self.drop = nn.Dropout(config.dropout)
-        self.knn_attention = KNNAttention(config, knn)
 
         self.embed = nn.Embedding(config.vocab_size, config.n_embd)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
@@ -354,11 +275,11 @@ class MemorizingGPT(nn.Module):
 
     def forward(
             self,
+            current_step: int,
             sliding_window_num_blocks: torch.Tensor,
-            idx: torch.Tensor,
-            target: torch.Tensor = None
+            idx: torch.Tensor
         ):
-        idx = torch.squeeze(idx)
+        # idx = torch.squeeze(idx)
         seq_len = len(idx)
         assert seq_len % self.head_dim == 0, (
             f"seq_len = {seq_len}, self.head_dim = {self.head_dim}"
@@ -417,29 +338,14 @@ class MemorizingGPT(nn.Module):
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
-            if i == self.num_decoder_layers - 2:
-                x = x + self.skip_weights[i] * skip_connections.pop()
-                x = self.knn_attention(x)
-                x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
-            else:
                 x = x + self.skip_weights[i] * skip_connections.pop()
                 x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
 
         x = norm(x)
-        if target is not None:
-            # if we are given some desired target also calculate the loss
-            logits = self.lm_head(x)
-            logits = 30 * torch.tanh(logits / 30)
-            target = target.view(-1)
-            if logits.size(0) > target.size(0):
-              logits = logits[-target.size(0):]
-            logits = logits.view(-1, logits.size(-1))
-            target = target.view(-1)
-            loss = F.cross_entropy(logits, target, ignore_index=-1)
-        else:
-            loss = None
-
-        return loss
+        logits = self.lm_head(x)
+        logits = 15 * torch.tanh(logits / 15)
+        logits = logits.view(-1, logits.size(-1))
+        return logits
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=0.9):
