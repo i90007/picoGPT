@@ -58,9 +58,9 @@ if not torch.cuda.is_available():
 class GPTConfig:
     sequence_length : int = 2048 # sequence length, in tokens (2048 is max reasonable for openwebtext dataset)
     vocab_size : int      = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer : int         = 18 # size of the model (n_head * 2)
-    n_head : int          = 9 # size of the model (hed size = 128)
-    n_embd : int          = 1152 # size of the model
+    n_layer : int         = 14 # size of the model (n_head * 2)
+    n_head : int          = 7 # size of the model (hed size = 128)
+    n_embd : int          = 896 # size of the model
     dropout : float       = 0.1 #
     # the maximum number of memories (~2.7GB) that will be stored locally
     max_knn_memories: bool= 500000
