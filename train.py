@@ -26,6 +26,7 @@ import contextlib
 from dataclasses import dataclass
 import numpy as np
 import torch
+from torch import nn
 import torch.nn.functional as F
 import torch._inductor.config as config
 import torch._dynamo
@@ -58,13 +59,13 @@ if not torch.cuda.is_available():
 class GPTConfig:
     sequence_length : int = 2048 # sequence length, in tokens (2048 is max reasonable for openwebtext dataset)
     vocab_size : int      = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer : int         = 14 # size of the model (n_head * 2)
-    n_head : int          = 7 # size of the model (hed size = 128)
-    n_embd : int          = 896 # size of the model
+    n_layer : int         = 18 # size of the model (n_head * 2)
+    n_head : int          = 9 # size of the model (hed size = 128)
+    n_embd : int          = 1152 # size of the model
     dropout : float       = 0.1 #
     # the maximum number of memories (~2.7GB) that will be stored locally
     max_knn_memories: bool= 500000
-    num_iterations : int  = 400 # number of iterations to run (100 for tinyshakespeare, 2000 for openwebtext)
+    num_iterations : int  = 300 # number of iterations to run (100 for tinyshakespeare, 2000 for openwebtext)
 configGpt = GPTConfig()
 @dataclass
 class Hyperparameters:
@@ -79,7 +80,7 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int   = 100 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
     val_steps : int        = 10
-    save_every : int       = 200 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int       = 150 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 # we are running on a single gpu, and one process
 tokens_per_iter = args.batch_size * args.device_batch_size * configGpt.sequence_length
@@ -236,6 +237,12 @@ for m in model.modules():
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True
 # compile the model
+def initialize_weights(module):
+    if isinstance(module, (nn.Linear, nn.Embedding)):
+        nn.init.xavier_uniform_(module.weight)
+    if isinstance(module, nn.Linear) and module.bias is not None:
+        nn.init.zeros_(module.bias)
+model.apply(initialize_weights)
 print("compiling the model... (takes a ~minute)")
 model = torch.compile(model) # backend="onnxrt"
 
@@ -254,7 +261,7 @@ def compute_knn_loss(knn_results, logits, lambda_knn=0.1):
 # init the optimizer(s)
 embed_params = [*model.embed.parameters(), *model.value_embeds.parameters(), *knn.get_parameters()]
 optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([model.lm_head.weight, model.skip_weights], lr=0.008, betas=(0.8, 0.95), fused=True)
 params = list(model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [model.skip_weights]
@@ -394,6 +401,7 @@ for step in range(configGpt.num_iterations + 1):
         group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
 
     # step the optimizers and schedulers
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
         sched.step()
@@ -403,6 +411,6 @@ for step in range(configGpt.num_iterations + 1):
     # everything that follows now is just diagnostics, prints, logging, etc.
     approx_time = training_time_ms + time.time() - t0
     print(f"step: {step+1}/{configGpt.num_iterations} train_time: {approx_time:.0f}s step_avg: {approx_time/timed_steps:.0f}s")
-
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
     torch.cuda.empty_cache()

@@ -75,7 +75,6 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(dim, n_head)
         # output projection
         self.c_proj = CastedLinear(dim, dim)
-        nn.init.xavier_uniform_(self.c_proj.weight)
 
     def forward(self, x, vi, block_mask):
         B, T, _ = x.size()  # batch size, sequence length (T), embedding_dim
