@@ -65,7 +65,7 @@ class GPTConfig:
     dropout : float       = 0.1 #
     # the maximum number of memories (~2.7GB) that will be stored locally
     max_knn_memories: bool= 500000
-    num_iterations : int  = 300 # number of iterations to run (100 for tinyshakespeare, 2000 for openwebtext)
+    num_iterations : int  = 200 # number of iterations to run (100 for tinyshakespeare, 2000 for openwebtext)
 configGpt = GPTConfig()
 @dataclass
 class Hyperparameters:
@@ -80,7 +80,7 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int   = 100 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
     val_steps : int        = 10
-    save_every : int       = 150 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int       = 100 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 # we are running on a single gpu, and one process
 tokens_per_iter = args.batch_size * args.device_batch_size * configGpt.sequence_length
@@ -330,6 +330,7 @@ for step in range(configGpt.num_iterations + 1):
         val_loss = 0.0
         for _ in range(args.val_steps):
             with torch.no_grad():
+                model.skip_weights.data.uniform_(0.1, 0.5)
                 x_val, y_val = next_batch('val')
                 logits = model(sliding_window_num_blocks, x_val)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y_val.view(-1))
