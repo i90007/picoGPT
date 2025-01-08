@@ -75,8 +75,8 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int       = 1 # batch size, in sequences, across all devices (shold be as low as possible)
     device_batch_size : int= 1 # batch size, in sequences, per device
-    warmup_iters : int     = 0
-    cooldown_iters : int   = 60 # number of iterations of linear warmup for triangular or trapezoidal schedule (60 for tinyshakespeare, 600 for openwebtext 1B)
+    warmup_iters : int     = 1
+    cooldown_iters : int   = 10
     # evaluation and logging hyperparams
     val_loss_every : int   = 100 # every how many steps to evaluate val loss? 0 for only at the end (10 for tinyshakespeare, 100 for openwebtext 1B)
     val_steps : int        = 10
@@ -266,7 +266,7 @@ params = list(model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.001, betas=(0.8, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
@@ -330,7 +330,6 @@ for step in range(configGpt.num_iterations + 1):
         val_loss = 0.0
         for _ in range(args.val_steps):
             with torch.no_grad():
-                model.skip_weights.data.uniform_(0.1, 0.5)
                 x_val, y_val = next_batch('val')
                 logits = model(sliding_window_num_blocks, x_val)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y_val.view(-1))
