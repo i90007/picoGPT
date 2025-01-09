@@ -65,7 +65,7 @@ class GPTConfig:
     dropout : float       = 0.1 #
     # the maximum number of memories (~2.7GB) that will be stored locally
     max_knn_memories: bool= 500000
-    num_iterations : int  = 250 # number of iterations to run
+    num_iterations : int  = 200 # number of iterations to run
 configGpt = GPTConfig()
 @dataclass
 class Hyperparameters:
@@ -78,9 +78,9 @@ class Hyperparameters:
     warmup_iters : int     = 1
     cooldown_iters : int   = 10
     # evaluation and logging hyperparams
-    val_loss_every : int   = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every : int   = 100 # every how many steps to evaluate val loss? 0 for only at the end
     val_steps : int        = 10
-    save_every : int       = 125 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int       = 100 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 # we are running on a single gpu, and one process
 tokens_per_iter = args.batch_size * args.device_batch_size * configGpt.sequence_length
