@@ -266,7 +266,7 @@ params = list(model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.001, betas=(0.8, 0.95), fused=True)
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.0001, betas=(0.8, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
@@ -330,6 +330,7 @@ for step in range(configGpt.num_iterations + 1):
         val_loss = 0.0
         for _ in range(args.val_steps):
             with torch.no_grad():
+                model.skip_weights.data.uniform_(0.1, 0.5)
                 x_val, y_val = next_batch('val')
                 logits = model(sliding_window_num_blocks, x_val)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y_val.view(-1))
