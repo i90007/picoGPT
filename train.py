@@ -1,18 +1,18 @@
 """
 https://github.com/i90007/picoGPT
-The training script for running on a single gpu
+The training script for running on a single GPU (Nvidia T4)
 Little logs:
-1) openwebtext 0.8B, 1 T4 GPU, Google Colab, 53m.
-number of parameters: 1208.23M
-sequence_length = 1152
-n_layer         = 22
-n_head          = 16
-n_embd          = 1024
-dropout         = 0.4
+1) openwebtext 2B, 1 T4 GPU, Google Colab, 
+number of parameters: 924.11M
+sequence_length = 2048
+n_layer         = 18
+n_head          = 9
+n_embd          = 1152
+dropout         = 0.1
 max_knn_memories= 500000
-num_iterations  = 490
-step: 0-400 val_loss: 6.500 train_time:2278108ms step_avg: 5841.30ms
-step: 400-900 val_loss: 6.312 train_time:2953.8072106838226s step_avg: 6.03ms
+num_iterations  = 200
+peak memory consumption: 14821 MiB
+step: 70 val_loss: 
 """
 import gc
 import os
@@ -75,7 +75,7 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int       = 1 # batch size, in sequences, across all devices (shold be as low as possible)
     device_batch_size : int= 1 # batch size, in sequences, per device
-    warmup_iters : int     = 1
+    warmup_iters : int     = 0
     cooldown_iters : int   = 10
     # evaluation and logging hyperparams
     val_loss_every : int   = 100 # every how many steps to evaluate val loss? 0 for only at the end
@@ -266,7 +266,7 @@ params = list(model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.0001, betas=(0.8, 0.95), fused=True)
+optimizer4 = torch.optim.Adam(scalar_params, lr=1e-5, betas=(0.8, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
@@ -281,7 +281,7 @@ def get_lr(it):
     else:
         return (configGpt.num_iterations - it) / args.cooldown_iters
 # resume optimizers
-if init_from == 'resume':
+if init_from == 'resume' or init_from == 'resume_google_drive':
     optimizer1.load_state_dict(checkpoint['optimizers'][0])
     optimizer2.load_state_dict(checkpoint['optimizers'][1])
     optimizer3.load_state_dict(checkpoint['optimizers'][2])
@@ -337,7 +337,7 @@ for step in range(configGpt.num_iterations + 1):
                 val_loss += loss
         val_loss /= args.val_steps
         # log val loss to console and to logfile
-        print(f'step: {step}/{configGpt.num_iterations} val_loss: {val_loss:.3f} train_time: {training_time_ms:.0f}s step_avg: {training_time_ms/(timed_steps-1):.1f}s')
+        print(f'step: {step}/{configGpt.num_iterations}, val_loss: {val_loss:.3f}, train_time: {training_time_ms:.0f}s, step_avg: {training_time_ms/(timed_steps-1):.1f}s')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -411,7 +411,7 @@ for step in range(configGpt.num_iterations + 1):
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
     approx_time = training_time_ms + time.time() - t0
-    print(f"step: {step+1}/{configGpt.num_iterations} train_time: {approx_time:.0f}s step_avg: {approx_time/timed_steps:.0f}s")
+    print(f"step: {step+1}/{configGpt.num_iterations}, train_time: {approx_time:.0f}s, step_avg: {approx_time/timed_steps:.0f}s")
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
     torch.cuda.empty_cache()
