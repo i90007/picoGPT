@@ -24,13 +24,6 @@ OpenAI GPT-2 checkpoints allow us to get some baselines in place for openwebtext
 
 - ~~Add memorising like [here](https://colab.research.google.com/drive/1XZz1sjNt1MKRG6ul_hOGSJFQLS4lRtmJ).~~
 - Teach the model to communicate in the form of a chat.
-- Teach the model to communicate by voice as the main model of chatGPT. I'm going to add a seperate agent for a voice recognition (via OpenAI Swarm).
-- Add separate agent/model for math (also via OpenAI Swarm).
-- Add separate model for coding (OpenAI Swarm).
-- Add web search feature.
-- Teach Llm to pass SimpleQA benchmark.
-- Make to work it locally like an app or like a web page.
-- Add more functionality with separate small models (via Swarm) and make sure everything works fine on an usual phone.
 
 ## troubleshooting
 
